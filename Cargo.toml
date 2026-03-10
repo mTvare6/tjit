@@ -1,0 +1,10 @@
+[package]
+name = "tjit"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cranelift = "0.105.0"
+cranelift-jit = "0.105.0"
+cranelift-module = "0.105.0"
+cranelift-native = "0.105.0"
