@@ -4,6 +4,8 @@ use crate::lexer::Token;
 pub enum Expr {
     Number(i64),
     BinaryOp(Box<Expr>, Op, Box<Expr>),
+    Variable(String),
+    Let(String, Box<Expr>),
 }
 
 #[derive(Debug)]
@@ -41,6 +43,7 @@ impl<'a> Parser<'a> {
     fn parse_primary(&mut self) -> Option<Expr> {
         match self.next()? {
             Token::Number(n) => Some(Expr::Number(*n)),
+            Token::Identifier(name) => Some(Expr::Variable(name.clone())),
             _ => None,
         }
     }
@@ -89,7 +92,43 @@ impl<'a> Parser<'a> {
         Some(left)
     }
 
-    pub fn parse(&mut self) -> Option<Expr> {
-        self.parse_term()
+    pub fn parse_declaration(&mut self) -> Option<Expr> {
+        let Some(Token::Let) = self.peek() else {
+            return self.parse_term();
+        };
+
+        self.next();
+
+        let name = match self.next() {
+            Some(Token::Identifier(n)) => n.clone(),
+            _ => panic!("Expected variable name after 'let'"),
+        };
+
+        match self.next() {
+            Some(Token::Assign) => {}
+            _ => panic!("Expected '=' after variable name"),
+        }
+
+        let value = self.parse_term()?;
+
+        Some(Expr::Let(name, Box::new(value)))
+    }
+
+    pub fn parse(&mut self) -> Vec<Expr> {
+        let mut program = Vec::new();
+
+        loop {
+            if self.peek().is_none_or(|t| *t == Token::EOF) {
+                break;
+            }
+
+            if let Some(expr) = self.parse_declaration() {
+                program.push(expr);
+            } else {
+                panic!("Failed to parse at token: {:?}", self.peek());
+            }
+        }
+
+        program
     }
 }

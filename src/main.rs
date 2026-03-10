@@ -4,6 +4,7 @@ mod parser;
 use cranelift::prelude::*;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
+use std::collections::HashMap;
 use std::mem;
 
 use lexer::Lexer;
@@ -13,14 +14,17 @@ pub struct JITEngine {
     builder_ctx: FunctionBuilderContext,
     ctx: codegen::Context,
     module: JITModule,
+
+    variables: HashMap<String, Variable>,
+    variable_index: usize,
 }
 
 impl JITEngine {
     pub fn new() -> Self {
-        // Setup architecture flags
+        // setup architecture flags
         let mut flag_builder = settings::builder();
         flag_builder.set("use_colocated_libcalls", "false").unwrap();
-        flag_builder.set("is_pic", "false").unwrap(); // We are jiting, no position independent code needed
+        flag_builder.set("is_pic", "false").unwrap(); // jiting, no position independent code needed
 
         let isa_builder = cranelift_native::builder().unwrap();
         let isa = isa_builder
@@ -35,15 +39,18 @@ impl JITEngine {
             builder_ctx: FunctionBuilderContext::new(),
             ctx: module.make_context(),
             module,
+            variables: HashMap::new(),
+            variable_index: 0,
         }
     }
 
-    pub fn compile(&mut self, expr: &Expr) -> Result<fn() -> i64, String> {
+    pub fn compile(&mut self, program: &[Expr]) -> Result<fn() -> i64, String> {
         self.ctx
             .func
             .signature
             .returns
             .push(AbiParam::new(types::I64));
+
         let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.builder_ctx);
 
         // create the entry block (the `{` of the function)
@@ -52,10 +59,18 @@ impl JITEngine {
         builder.switch_to_block(entry_block);
         builder.seal_block(entry_block);
 
-        let result_val = Self::compile_expr(expr, &mut builder);
+        let mut return_val = builder.ins().iconst(types::I64, 0); // default return value
+        for expr in program {
+            return_val = Self::compile_expr(
+                expr,
+                &mut builder,
+                &mut self.variables,
+                &mut self.variable_index,
+            );
+        }
 
         // emit the return instruction (the `}` of the function)
-        builder.ins().return_(&[result_val]);
+        builder.ins().return_(&[return_val]);
         builder.finalize();
 
         // define and finalize the machine code into RAM
@@ -78,12 +93,17 @@ impl JITEngine {
         unsafe { Ok(mem::transmute::<*const u8, fn() -> i64>(code_ptr)) }
     }
 
-    fn compile_expr(expr: &Expr, builder: &mut FunctionBuilder) -> Value {
+    fn compile_expr(
+        expr: &Expr,
+        builder: &mut FunctionBuilder,
+        variables: &mut HashMap<String, Variable>,
+        variable_index: &mut usize,
+    ) -> Value {
         match expr {
             Expr::Number(n) => builder.ins().iconst(types::I64, *n),
             Expr::BinaryOp(left, op, right) => {
-                let lhs = Self::compile_expr(left, builder);
-                let rhs = Self::compile_expr(right, builder);
+                let lhs = Self::compile_expr(left, builder, variables, variable_index);
+                let rhs = Self::compile_expr(right, builder, variables, variable_index);
 
                 match op {
                     Op::Add => builder.ins().iadd(lhs, rhs),
@@ -92,16 +112,29 @@ impl JITEngine {
                     Op::Divide => builder.ins().sdiv(lhs, rhs),
                 }
             }
+            Expr::Variable(name) => variables
+                .get(name)
+                .map(|var| builder.use_var(*var))
+                .unwrap_or_else(|| panic!("Undefined variable: {}", name)),
+            Expr::Let(name, value) => {
+                let val = Self::compile_expr(value, builder, variables, variable_index);
+                let var = Variable::new(*variable_index);
+                *variable_index += 1;
+                builder.declare_var(var, types::I64);
+                builder.def_var(var, val);
+                variables.insert(name.clone(), var);
+                val // return of let is the value assigned
+            }
         }
     }
 }
 
 fn main() {
-    let source = "3 + 4 * 2 - 4 / 2";
+    let source = "let x = 10\nx * 2";
     let mut lexer = Lexer::new(&source);
     let tokens = lexer.collect_tokens();
     let mut parser = Parser::new(&tokens);
-    let ast = parser.parse().unwrap();
+    let ast = parser.parse();
 
     let mut jit = JITEngine::new();
 

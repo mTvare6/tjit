@@ -14,7 +14,7 @@ pub enum Token {
     Divide,
     Assign,
 
-    // 
+    // Keywords
     Let,
 
     // Control
