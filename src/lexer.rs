@@ -68,7 +68,7 @@ impl<'a> Lexer<'a> {
     pub fn next_token(&mut self) -> Token {
         while let Some(&ch) = self.chars.peek() {
             match ch {
-                ' ' | '\t' | '\n' => {
+                ' ' | '\t' | '\n' | ';' => {
                     self.chars.next();
                     continue;
                 }

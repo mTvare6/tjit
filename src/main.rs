@@ -129,8 +129,31 @@ impl JITEngine {
     }
 }
 
+// Read the entire source code from stdin until EOF with prompt
+fn read_source() -> String {
+    use std::io::{self, Write};
+
+    let mut source = String::new();
+    loop {
+        print!("> ");
+        io::stdout().flush().unwrap();
+
+        let mut line = String::new();
+        match io::stdin().read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => source.push_str(&line),
+            Err(e) => {
+                eprintln!("Error reading input: {}", e);
+                break;
+            }
+        }
+    }
+    source
+}
+
 fn main() {
-    let source = "let x = 10\nx * 2";
+    let source = read_source();
+    println!();
     let mut lexer = Lexer::new(&source);
     let tokens = lexer.collect_tokens();
     let mut parser = Parser::new(&tokens);
