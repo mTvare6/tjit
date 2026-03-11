@@ -6,6 +6,7 @@ pub enum Expr {
     BinaryOp(Box<Expr>, Op, Box<Expr>),
     Variable(String),
     Let(String, Box<Expr>),
+    If(Box<Expr>, Box<Expr>, Box<Expr>),
 }
 
 #[derive(Debug)]
@@ -14,6 +15,12 @@ pub enum Op {
     Subtract,
     Multiply,
     Divide,
+
+    Eq,
+    Lt,
+    Gt,
+    Le,
+    Ge,
 }
 
 pub struct Parser<'a> {
@@ -94,7 +101,7 @@ impl<'a> Parser<'a> {
 
     pub fn parse_declaration(&mut self) -> Option<Expr> {
         let Some(Token::Let) = self.peek() else {
-            return self.parse_term();
+            return self.parse_if();
         };
 
         self.next();
@@ -109,9 +116,81 @@ impl<'a> Parser<'a> {
             _ => panic!("Expected '=' after variable name"),
         }
 
-        let value = self.parse_term()?;
+        let value = self.parse_if()?;
 
         Some(Expr::Let(name, Box::new(value)))
+    }
+
+    fn parse_if(&mut self) -> Option<Expr> {
+        let Some(Token::If) = self.peek() else {
+            return self.parse_relational();
+        };
+
+        self.next();
+
+        let condition = self.parse_relational()?;
+
+        let Some(Token::LBrace) = self.next() else {
+            panic!("Expected '{{' after 'if'");
+        };
+
+        let then_branch = self.parse_relational()?;
+
+        let Some(Token::RBrace) = self.next() else {
+            panic!("Expected '}}' after then branch");
+        };
+
+        let Some(Token::Else) = self.next() else {
+            panic!("Expected 'else' after then branch");
+        };
+
+        let else_branch = if self.peek() == Some(&Token::If) {
+            self.parse_if()?
+        } else {
+            let Some(Token::LBrace) = self.next() else {
+                panic!("Expected '{{' after 'else'");
+            };
+            let term = self.parse_relational()?;
+            let Some(Token::RBrace) = self.next() else {
+                panic!("Expected '}}' after else branch");
+            };
+            term
+        };
+
+        Some(Expr::If(
+            Box::new(condition),
+            Box::new(then_branch),
+            Box::new(else_branch),
+        ))
+    }
+
+    fn parse_relational(&mut self) -> Option<Expr> {
+        let mut left = self.parse_term()?;
+
+        while let Some(token) = self.peek() {
+            match token {
+                Token::Equal
+                | Token::LessThan
+                | Token::LessThanEqual
+                | Token::GreaterThan
+                | Token::GreaterThanEqual => {
+                    let op = match token {
+                        Token::Equal => Op::Eq,
+                        Token::LessThan => Op::Lt,
+                        Token::LessThanEqual => Op::Le,
+                        Token::GreaterThan => Op::Gt,
+                        Token::GreaterThanEqual => Op::Ge,
+                        _ => unreachable!(),
+                    };
+                    self.forward();
+                    let right = self.parse_term()?;
+                    left = Expr::BinaryOp(Box::new(left), op, Box::new(right));
+                }
+                _ => break,
+            }
+        }
+
+        Some(left)
     }
 
     pub fn parse(&mut self) -> Vec<Expr> {

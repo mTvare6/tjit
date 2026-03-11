@@ -16,9 +16,24 @@ pub enum Token {
 
     // Keywords
     Let,
+    If,
+    Else,
+
+    // Relational
+    LessThan,
+    GreaterThan,
+    LessThanEqual,
+    GreaterThanEqual,
+    Equal,
 
     // Control
     EOF,
+
+    // Delimiters
+    LParen,
+    RParen,
+    LBrace,
+    RBrace,
 }
 
 pub struct Lexer<'a> {
@@ -61,6 +76,8 @@ impl<'a> Lexer<'a> {
         let ident = self.read_ident();
         match ident.as_str() {
             "let" => Token::Let,
+            "if" => Token::If,
+            "else" => Token::Else,
             _ => Token::Identifier(ident),
         }
     }
@@ -90,10 +107,46 @@ impl<'a> Lexer<'a> {
                 }
                 '=' => {
                     self.chars.next();
+                    if self.chars.peek() == Some(&'=') {
+                        self.chars.next();
+                        return Token::Equal;
+                    }
                     return Token::Assign;
+                }
+                '<' => {
+                    self.chars.next();
+                    if self.chars.peek() == Some(&'=') {
+                        self.chars.next();
+                        return Token::LessThanEqual;
+                    }
+                    return Token::LessThan;
+                }
+                '>' => {
+                    self.chars.next();
+                    if self.chars.peek() == Some(&'=') {
+                        self.chars.next();
+                        return Token::GreaterThanEqual;
+                    }
+                    return Token::GreaterThan;
                 }
                 '0'..='9' => return self.lex_number(),
                 'a'..='z' | 'A'..='Z' => return self.lex_identifier(),
+                '(' => {
+                    self.chars.next();
+                    return Token::LParen;
+                }
+                ')' => {
+                    self.chars.next();
+                    return Token::RParen;
+                }
+                '{' => {
+                    self.chars.next();
+                    return Token::LBrace;
+                }
+                '}' => {
+                    self.chars.next();
+                    return Token::RBrace;
+                }
                 _ => panic!("Unexpected character: {}", ch),
             }
         }
