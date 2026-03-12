@@ -5,13 +5,18 @@ use cranelift_module::{Linkage, Module};
 use std::collections::HashMap;
 use std::mem;
 
+type LoopStack = Vec<(Block, Block)>;
+type VariableMap = HashMap<String, Variable>;
+
 pub struct JITEngine {
     builder_ctx: FunctionBuilderContext,
     ctx: codegen::Context,
     module: JITModule,
 
-    variables: HashMap<String, Variable>,
+    variables: VariableMap,
     variable_index: usize,
+
+    loop_stack: LoopStack, // stack of (loop_start, loop_end) blocks for break/continue
 }
 
 impl JITEngine {
@@ -36,6 +41,7 @@ impl JITEngine {
             module,
             variables: HashMap::new(),
             variable_index: 0,
+            loop_stack: Vec::new(),
         }
     }
 
@@ -56,12 +62,15 @@ impl JITEngine {
 
         let mut return_val = builder.ins().iconst(types::I64, 0); // default return value
         for expr in program {
-            return_val = Self::compile_expr(
+            if let Some(val) = Self::compile_expr(
                 expr,
                 &mut builder,
                 &mut self.variables,
                 &mut self.variable_index,
-            );
+                &mut self.loop_stack,
+            ) {
+                return_val = val; // update return value to the last expression's value
+            }
         }
 
         // emit the return instruction (the `}` of the function)
@@ -95,16 +104,18 @@ impl JITEngine {
     fn compile_expr(
         expr: &Expr,
         builder: &mut FunctionBuilder,
-        variables: &mut HashMap<String, Variable>,
+        variables: &mut VariableMap,
         variable_index: &mut usize,
-    ) -> Value {
+        loop_stack: &mut LoopStack,
+    ) -> Option<Value> {
         match expr {
-            Expr::Number(n) => builder.ins().iconst(types::I64, *n),
+            Expr::Number(n) => Some(builder.ins().iconst(types::I64, *n)),
             Expr::BinaryOp(left, op, right) => {
-                let lhs = Self::compile_expr(left, builder, variables, variable_index);
-                let rhs = Self::compile_expr(right, builder, variables, variable_index);
+                let lhs = Self::compile_expr(left, builder, variables, variable_index, loop_stack)?;
+                let rhs =
+                    Self::compile_expr(right, builder, variables, variable_index, loop_stack)?;
 
-                match op {
+                Some(match op {
                     Op::Add => builder.ins().iadd(lhs, rhs),
                     Op::Subtract => builder.ins().isub(lhs, rhs),
                     Op::Multiply => builder.ins().imul(lhs, rhs),
@@ -126,26 +137,42 @@ impl JITEngine {
                         builder.ins().uextend(types::I64, bool_val)
                     }
                     Op::Ge => {
-                        let bool_val = builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, lhs, rhs);
+                        let bool_val =
+                            builder
+                                .ins()
+                                .icmp(IntCC::SignedGreaterThanOrEqual, lhs, rhs);
                         builder.ins().uextend(types::I64, bool_val)
                     }
-                }
+                })
             }
-            Expr::Variable(name) => variables
-                .get(name)
-                .map(|var| builder.use_var(*var))
-                .unwrap_or_else(|| panic!("Undefined variable: {}", name)),
+            Expr::Variable(name) => Some(
+                variables
+                    .get(name)
+                    .map(|var| builder.use_var(*var))
+                    .unwrap_or_else(|| panic!("Undefined variable: {}", name)),
+            ),
             Expr::Let(name, value) => {
-                let val = Self::compile_expr(value, builder, variables, variable_index);
+                let val =
+                    Self::compile_expr(value, builder, variables, variable_index, loop_stack)?;
                 let var = Variable::new(*variable_index);
                 *variable_index += 1;
                 builder.declare_var(var, types::I64);
                 builder.def_var(var, val);
                 variables.insert(name.clone(), var);
-                val // return of let is the value assigned
+                Some(val) // return of let is the value assigned
+            }
+            Expr::Assign(name, value) => {
+                let val =
+                    Self::compile_expr(value, builder, variables, variable_index, loop_stack)?;
+                variables
+                    .get(name)
+                    .map(|var| builder.def_var(*var, val))
+                    .unwrap_or_else(|| panic!("Undefined variable: {}", name));
+                Some(val)
             }
             Expr::If(cond, then_branch, else_branch) => {
-                let cond_val = Self::compile_expr(cond, builder, variables, variable_index);
+                let cond_val =
+                    Self::compile_expr(cond, builder, variables, variable_index, loop_stack)?;
 
                 let then_block = builder.create_block();
                 let else_block = builder.create_block();
@@ -159,21 +186,78 @@ impl JITEngine {
 
                 builder.switch_to_block(then_block);
                 builder.seal_block(then_block);
+                let then_val =
+                    Self::compile_expr(then_branch, builder, variables, variable_index, loop_stack);
 
-                let then_val = Self::compile_expr(then_branch, builder, variables, variable_index);
-                builder.ins().jump(merge_block, &[then_val]);
+                if let Some(val) = then_val {
+                    builder.ins().jump(merge_block, &[val]);
+                }
 
                 builder.switch_to_block(else_block);
                 builder.seal_block(else_block);
+                let else_val =
+                    Self::compile_expr(else_branch, builder, variables, variable_index, loop_stack);
 
-                let else_val = Self::compile_expr(else_branch, builder, variables, variable_index);
-                builder.ins().jump(merge_block, &[else_val]);
+                if let Some(val) = else_val {
+                    builder.ins().jump(merge_block, &[val]);
+                }
 
                 builder.switch_to_block(merge_block);
                 builder.seal_block(merge_block);
 
-                let phi = builder.block_params(merge_block)[0];
-                phi
+                if then_val.is_none() && else_val.is_none() {
+                    None
+                } else {
+                    Some(builder.block_params(merge_block)[0])
+                }
+            }
+            Expr::Loop(body) => {
+                let header_block = builder.create_block();
+                let exit_block = builder.create_block();
+
+                loop_stack.push((header_block, exit_block));
+
+                builder.append_block_param(exit_block, types::I64);
+
+                builder.ins().jump(header_block, &[]);
+                builder.switch_to_block(header_block);
+
+                let inner_val =
+                    Self::compile_expr(body, builder, variables, variable_index, loop_stack);
+
+                if inner_val.is_some() {
+                    builder.ins().jump(header_block, &[]);
+                }
+
+                loop_stack.pop();
+
+                builder.switch_to_block(exit_block);
+
+                builder.seal_block(header_block);
+                builder.seal_block(exit_block);
+
+                Some(builder.block_params(exit_block)[0])
+            }
+            Expr::Break(body) => {
+                let loop_end = match loop_stack.last() {
+                    Some((_, end)) => *end,
+                    None => panic!("'break' used outside of a loop"),
+                };
+
+                let val = Self::compile_expr(body, builder, variables, variable_index, loop_stack)?;
+
+                // dummy value to satisfy the type system
+                builder.ins().jump(loop_end, &[val]);
+
+                None
+            }
+            Expr::Continue => {
+                if let Some((loop_start, _)) = loop_stack.last() {
+                    builder.ins().jump(*loop_start, &[]);
+                    None
+                } else {
+                    panic!("'continue' used outside of a loop");
+                }
             }
         }
     }

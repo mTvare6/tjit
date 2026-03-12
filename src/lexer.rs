@@ -18,6 +18,9 @@ pub enum Token {
     Let,
     If,
     Else,
+    Loop,
+    Break,
+    Continue,
 
     // Relational
     LessThan,
@@ -78,6 +81,9 @@ impl<'a> Lexer<'a> {
             "let" => Token::Let,
             "if" => Token::If,
             "else" => Token::Else,
+            "continue" => Token::Continue,
+            "break" => Token::Break,
+            "loop" => Token::Loop,
             _ => Token::Identifier(ident),
         }
     }

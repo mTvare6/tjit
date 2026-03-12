@@ -7,6 +7,10 @@ pub enum Expr {
     Variable(String),
     Let(String, Box<Expr>),
     If(Box<Expr>, Box<Expr>, Box<Expr>),
+    Loop(Box<Expr>),
+    Assign(String, Box<Expr>),
+    Break(Box<Expr>),
+    Continue,
 }
 
 #[derive(Debug)]
@@ -31,6 +35,10 @@ pub struct Parser<'a> {
 impl<'a> Parser<'a> {
     fn peek(&self) -> Option<&Token> {
         self.tokens.get(self.pos)
+    }
+
+    fn peek_next(&self) -> Option<&Token> {
+        self.tokens.get(self.pos + 1)
     }
 
     fn next(&mut self) -> Option<&Token> {
@@ -101,7 +109,7 @@ impl<'a> Parser<'a> {
 
     pub fn parse_declaration(&mut self) -> Option<Expr> {
         let Some(Token::Let) = self.peek() else {
-            return self.parse_if();
+            return self.parse_expression();
         };
 
         self.next();
@@ -116,25 +124,21 @@ impl<'a> Parser<'a> {
             _ => panic!("Expected '=' after variable name"),
         }
 
-        let value = self.parse_if()?;
+        let value = self.parse_expression()?;
 
         Some(Expr::Let(name, Box::new(value)))
     }
 
     fn parse_if(&mut self) -> Option<Expr> {
-        let Some(Token::If) = self.peek() else {
-            return self.parse_relational();
-        };
-
         self.next();
 
-        let condition = self.parse_relational()?;
+        let condition = self.parse_expression()?;
 
         let Some(Token::LBrace) = self.next() else {
             panic!("Expected '{{' after 'if'");
         };
 
-        let then_branch = self.parse_relational()?;
+        let then_branch = self.parse_expression()?;
 
         let Some(Token::RBrace) = self.next() else {
             panic!("Expected '}}' after then branch");
@@ -150,7 +154,7 @@ impl<'a> Parser<'a> {
             let Some(Token::LBrace) = self.next() else {
                 panic!("Expected '{{' after 'else'");
             };
-            let term = self.parse_relational()?;
+            let term = self.parse_expression()?;
             let Some(Token::RBrace) = self.next() else {
                 panic!("Expected '}}' after else branch");
             };
@@ -191,6 +195,53 @@ impl<'a> Parser<'a> {
         }
 
         Some(left)
+    }
+
+    fn parse_expression(&mut self) -> Option<Expr> {
+        if let Some(Token::Identifier(name)) = self.peek() {
+            if self.peek_next() == Some(&Token::Assign) {
+                let var_name = name.clone();
+                self.next();
+                self.next();
+
+                let value = self.parse_expression()?;
+                return Some(Expr::Assign(var_name, Box::new(value)));
+            }
+        }
+        match self.peek() {
+            Some(Token::If) => self.parse_if(),
+            Some(Token::Loop) => self.parse_loop(),
+            Some(Token::Break) => self.parse_break(),
+            Some(Token::Continue) => {
+                self.next();
+                Some(Expr::Continue)
+            }
+            _ => self.parse_relational(),
+        }
+    }
+
+    fn parse_loop(&mut self) -> Option<Expr> {
+        self.next();
+
+        let Some(Token::LBrace) = self.next() else {
+            panic!("Expected '{{' after 'loop'");
+        };
+
+        let body = self.parse_expression()?;
+
+        let Some(Token::RBrace) = self.next() else {
+            panic!("Expected '}}' after loop body");
+        };
+
+        Some(Expr::Loop(Box::new(body)))
+    }
+
+    fn parse_break(&mut self) -> Option<Expr> {
+        self.next();
+
+        let payload = self.parse_expression()?;
+
+        Some(Expr::Break(Box::new(payload)))
     }
 
     pub fn parse(&mut self) -> Vec<Expr> {
