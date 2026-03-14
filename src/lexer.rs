@@ -21,6 +21,8 @@ pub enum Token {
     Loop,
     Break,
     Continue,
+    Fn,
+    Comma,
 
     // Relational
     LessThan,
@@ -84,6 +86,7 @@ impl<'a> Lexer<'a> {
             "continue" => Token::Continue,
             "break" => Token::Break,
             "loop" => Token::Loop,
+            "fn" => Token::Fn,
             _ => Token::Identifier(ident),
         }
     }
@@ -110,6 +113,10 @@ impl<'a> Lexer<'a> {
                 '/' => {
                     self.chars.next();
                     return Token::Divide;
+                }
+                ',' => {
+                    self.chars.next();
+                    return Token::Comma;
                 }
                 '=' => {
                     self.chars.next();

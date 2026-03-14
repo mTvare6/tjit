@@ -36,6 +36,8 @@ fn main() {
     let mut parser = Parser::new(&tokens);
     let ast = parser.parse();
 
+    // println!("{:#?}", ast);
+
     let mut jit = JITEngine::new();
 
     match jit.compile(&ast) {

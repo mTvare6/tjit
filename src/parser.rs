@@ -10,6 +10,9 @@ pub enum Expr {
     Loop(Box<Expr>),
     Assign(String, Box<Expr>),
     Break(Box<Expr>),
+    FnDecl(String, Vec<String>, Box<Expr>),
+    Call(String, Vec<Expr>),
+    Block(Vec<Expr>),
     Continue,
 }
 
@@ -56,9 +59,42 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_primary(&mut self) -> Option<Expr> {
-        match self.next()? {
-            Token::Number(n) => Some(Expr::Number(*n)),
-            Token::Identifier(name) => Some(Expr::Variable(name.clone())),
+        match self.peek()? {
+            Token::Number(n) => {
+                let val = *n;
+                self.next();
+                Some(Expr::Number(val))
+            }
+            Token::Identifier(name) => {
+                let var_name = name.clone();
+                self.next();
+
+                if self.peek() == Some(&Token::LParen) {
+                    self.next();
+                    let mut args = Vec::new();
+
+                    if self.peek() != Some(&Token::RParen) {
+                        loop {
+                            args.push(
+                                self.parse_expression()
+                                    .expect("Expected argument expression"),
+                            );
+                            if self.peek() == Some(&Token::Comma) {
+                                self.next();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+
+                    let Some(Token::RParen) = self.next() else {
+                        panic!("Expected ')' after arguments")
+                    };
+                    Some(Expr::Call(var_name, args))
+                } else {
+                    Some(Expr::Variable(var_name))
+                }
+            }
             _ => None,
         }
     }
@@ -107,11 +143,7 @@ impl<'a> Parser<'a> {
         Some(left)
     }
 
-    pub fn parse_declaration(&mut self) -> Option<Expr> {
-        let Some(Token::Let) = self.peek() else {
-            return self.parse_expression();
-        };
-
+    pub fn parse_var_decl(&mut self) -> Option<Expr> {
         self.next();
 
         let name = match self.next() {
@@ -129,20 +161,18 @@ impl<'a> Parser<'a> {
         Some(Expr::Let(name, Box::new(value)))
     }
 
+    pub fn parse_declaration(&mut self) -> Option<Expr> {
+        match self.peek() {
+            Some(Token::Fn) => self.parse_fn_decl(),
+            Some(Token::Let) => self.parse_var_decl(),
+            _ => self.parse_expression(),
+        }
+    }
+
     fn parse_if(&mut self) -> Option<Expr> {
         self.next();
-
         let condition = self.parse_expression()?;
-
-        let Some(Token::LBrace) = self.next() else {
-            panic!("Expected '{{' after 'if'");
-        };
-
-        let then_branch = self.parse_expression()?;
-
-        let Some(Token::RBrace) = self.next() else {
-            panic!("Expected '}}' after then branch");
-        };
+        let then_branch = self.parse_block()?;
 
         let Some(Token::Else) = self.next() else {
             panic!("Expected 'else' after then branch");
@@ -151,14 +181,7 @@ impl<'a> Parser<'a> {
         let else_branch = if self.peek() == Some(&Token::If) {
             self.parse_if()?
         } else {
-            let Some(Token::LBrace) = self.next() else {
-                panic!("Expected '{{' after 'else'");
-            };
-            let term = self.parse_expression()?;
-            let Some(Token::RBrace) = self.next() else {
-                panic!("Expected '}}' after else branch");
-            };
-            term
+            self.parse_block()?
         };
 
         Some(Expr::If(
@@ -166,6 +189,12 @@ impl<'a> Parser<'a> {
             Box::new(then_branch),
             Box::new(else_branch),
         ))
+    }
+
+    fn parse_loop(&mut self) -> Option<Expr> {
+        self.next();
+        let body = self.parse_block()?;
+        Some(Expr::Loop(Box::new(body)))
     }
 
     fn parse_relational(&mut self) -> Option<Expr> {
@@ -220,28 +249,70 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_loop(&mut self) -> Option<Expr> {
-        self.next();
-
-        let Some(Token::LBrace) = self.next() else {
-            panic!("Expected '{{' after 'loop'");
-        };
-
-        let body = self.parse_expression()?;
-
-        let Some(Token::RBrace) = self.next() else {
-            panic!("Expected '}}' after loop body");
-        };
-
-        Some(Expr::Loop(Box::new(body)))
-    }
-
     fn parse_break(&mut self) -> Option<Expr> {
         self.next();
 
         let payload = self.parse_expression()?;
 
         Some(Expr::Break(Box::new(payload)))
+    }
+
+    fn parse_block(&mut self) -> Option<Expr> {
+        let Some(Token::LBrace) = self.next() else {
+            panic!("Expected '{{' to start block");
+        };
+
+        let mut exprs = Vec::new();
+        while self.peek().is_some() && self.peek() != Some(&Token::RBrace) {
+            if let Some(expr) = self.parse_declaration() {
+                exprs.push(expr);
+            } else {
+                panic!("Failed to parse expression in block");
+            }
+        }
+
+        let Some(Token::RBrace) = self.next() else {
+            panic!("Expected '}}' to end block");
+        };
+
+        Some(Expr::Block(exprs))
+    }
+
+    fn parse_fn_decl(&mut self) -> Option<Expr> {
+        self.next();
+
+        let name = match self.next() {
+            Some(Token::Identifier(n)) => n.clone(),
+            _ => panic!("Expected function name"),
+        };
+
+        let Some(Token::LParen) = self.next() else {
+            panic!("Expected '(' after function name")
+        };
+
+        let mut params = Vec::new();
+        if self.peek() != Some(&Token::RParen) {
+            loop {
+                match self.next() {
+                    Some(Token::Identifier(p)) => params.push(p.clone()),
+                    _ => panic!("Expected parameter name"),
+                }
+
+                if self.peek() == Some(&Token::Comma) {
+                    self.next();
+                } else {
+                    break;
+                }
+            }
+        }
+
+        let Some(Token::RParen) = self.next() else {
+            panic!("Expected ')' after parameters")
+        };
+
+        let body = self.parse_block()?;
+
+        Some(Expr::FnDecl(name, params, Box::new(body)))
     }
 
     pub fn parse(&mut self) -> Vec<Expr> {
