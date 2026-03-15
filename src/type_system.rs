@@ -102,24 +102,33 @@ impl TypeChecker {
             Expr::Let(name, declared_type, value) => {
                 let mut typed_value = self.check_expr(value)?;
 
-                // Literal type coercion
-                if let TypedExpr::Number(n, _) = &mut typed_value {
-                    if declared_type.is_integer_type() {
-                        typed_value = TypedExpr::Number(*n, declared_type.clone());
-                    }
-                }
+                let resolved_type = match declared_type {
+                    Some(expected_ty) => {
+                        // literal type coercion against explicit annotation
+                        if let TypedExpr::Number(n, _) = &mut typed_value {
+                            if expected_ty.is_integer_type() {
+                                typed_value = TypedExpr::Number(*n, expected_ty.clone());
+                            }
+                        }
 
-                if typed_value.ty() != *declared_type {
-                    return Err(format!(
-                        "Type Error: Mismatched types. Expected {:?}, found {:?}",
-                        declared_type,
-                        typed_value.ty()
-                    ));
-                }
-                self.variables.insert(name.clone(), declared_type.clone());
+                        if typed_value.ty() != *expected_ty {
+                            return Err(format!(
+                                "Type Error: Mismatched types. Expected {:?}, found {:?}",
+                                expected_ty,
+                                typed_value.ty()
+                            ));
+                        }
+                        expected_ty.clone()
+                    }
+                    None => typed_value.ty(), // infer type dynamically from the evaluated expression
+                };
+
+                self.variables.insert(name.clone(), resolved_type.clone());
+
+                // MIR TypedExpr::Let still takes a strict, known Type.
                 Ok(TypedExpr::Let(
                     name.clone(),
-                    declared_type.clone(),
+                    resolved_type,
                     Box::new(typed_value),
                 ))
             }
@@ -153,8 +162,21 @@ impl TypeChecker {
                 ))
             }
             Expr::BinaryOp(left, op, right) => {
-                let t_left = self.check_expr(left)?;
-                let t_right = self.check_expr(right)?;
+                let mut t_left = self.check_expr(left)?;
+                let mut t_right = self.check_expr(right)?;
+
+                // cross-coercion, when one side is a raw literal and the other is a known expression,
+                // mutate the literal to match the known type
+                if let TypedExpr::Number(n, _) = &mut t_right {
+                    if t_left.ty().is_integer_type() {
+                        t_right = TypedExpr::Number(*n, t_left.ty());
+                    }
+                } else if let TypedExpr::Number(n, _) = &mut t_left {
+                    if t_right.ty().is_integer_type() {
+                        t_left = TypedExpr::Number(*n, t_right.ty());
+                    }
+                }
+
                 if t_left.ty() != t_right.ty() {
                     return Err(format!(
                         "Type Error: Binary operand mismatch. {:?} and {:?}",
@@ -262,7 +284,7 @@ impl TypeChecker {
                 for (arg, expected_type) in args.iter().zip(param_types.iter()) {
                     let mut t_arg = self.check_expr(arg)?;
 
-                    // Literal type coercion for arguments
+                    // literal type coercion for arguments
                     if let TypedExpr::Number(n, _) = &mut t_arg {
                         if expected_type.is_integer_type() {
                             t_arg = TypedExpr::Number(*n, expected_type.clone());

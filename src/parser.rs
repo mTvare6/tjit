@@ -7,7 +7,7 @@ pub enum Expr {
     Float(f64),
     BinaryOp(Box<Expr>, Op, Box<Expr>),
     Variable(String),
-    Let(String, Type, Box<Expr>),
+    Let(String, Option<Type>, Box<Expr>),
     If(Box<Expr>, Box<Expr>, Box<Expr>),
     Loop(Box<Expr>),
     Assign(String, Box<Expr>),
@@ -199,22 +199,23 @@ impl<'a> Parser<'a> {
         Some(left)
     }
 
-    pub fn parse_var_decl(&mut self) -> Option<Expr> {
-        self.next();
+pub fn parse_var_decl(&mut self) -> Option<Expr> {
+        self.next(); // Consume 'let'
 
         let name = match self.next() {
             Some(Token::Identifier(n)) => n.clone(),
             _ => panic!("Expected variable name after 'let'"),
         };
 
-        let Some(Token::Colon) = self.next() else {
-            panic!("Expected ':' after variable name");
-        };
-
-        let var_type = self.parse_type();
+        // check for optional type annotation
+        let mut var_type = None;
+        if self.peek() == Some(&Token::Colon) {
+            self.next();
+            var_type = Some(self.parse_type());
+        }
 
         let Some(Token::Assign) = self.next() else {
-            panic!("Expected ':' after variable name");
+            panic!("Expected '=' after variable name");
         };
 
         let value = self.parse_expression()?;
