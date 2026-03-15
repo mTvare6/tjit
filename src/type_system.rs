@@ -17,24 +17,30 @@ pub enum TypedExpr {
     Block(Vec<TypedExpr>, Type),
     Call(String, Vec<TypedExpr>, Type),
     FnDecl(String, Vec<(String, Type)>, Type, Box<TypedExpr>),
+    StructDecl(String, Vec<(String, Type)>),
+    StructInit(String, Vec<(String, Box<TypedExpr>)>),
+    FieldAccess(Box<TypedExpr>, String, Type),
 }
 
 impl TypedExpr {
     pub fn ty(&self) -> Type {
         match self {
-            TypedExpr::Number(_, t) => *t,
-            TypedExpr::Float(_) => Type::F64,
-            TypedExpr::Variable(_, t) => *t,
-            TypedExpr::Let(_, t, _) => *t,
-            TypedExpr::Assign(_, _, t) => *t,
-            TypedExpr::BinaryOp(_, _, _, t) => *t,
-            TypedExpr::If(_, _, _, t) => *t,
-            TypedExpr::Loop(_, t) => *t,
+            TypedExpr::Variable(_, t)
+            | TypedExpr::Let(_, t, _)
+            | TypedExpr::Assign(_, _, t)
+            | TypedExpr::BinaryOp(_, _, _, t)
+            | TypedExpr::If(_, _, _, t)
+            | TypedExpr::Loop(_, t)
+            | TypedExpr::Number(_, t)
+            | TypedExpr::Block(_, t)
+            | TypedExpr::Call(_, _, t) => t.clone(),
             TypedExpr::Break(e) => e.ty(),
+            TypedExpr::Float(_) => Type::F64,
             TypedExpr::Continue => Type::I64,
-            TypedExpr::Block(_, t) => *t,
-            TypedExpr::Call(_, _, t) => *t,
             TypedExpr::FnDecl(..) => Type::I64,
+            TypedExpr::StructDecl(..) => Type::I64,
+            TypedExpr::StructInit(name, _) => Type::Custom(name.clone()),
+            TypedExpr::FieldAccess(_, _, t) => t.clone(),
         }
     }
 }
@@ -55,9 +61,16 @@ impl Type {
     }
 }
 
+#[derive(Clone)]
+pub struct StructLayout {
+    pub size: u32,
+    pub fields: HashMap<String, (Type, i32)>, // maps field name to its (type, byte_offset)
+}
+
 pub struct TypeChecker {
     variables: HashMap<String, Type>,
     functions: HashMap<String, (Vec<Type>, Type)>,
+    structs: HashMap<String, StructLayout>,
     loop_break_type: Option<Type>,
 }
 
@@ -66,16 +79,36 @@ impl TypeChecker {
         Self {
             variables: HashMap::new(),
             functions: HashMap::new(),
+            structs: HashMap::new(),
             loop_break_type: None,
         }
     }
 
     pub fn check_program(&mut self, program: &[Expr]) -> Result<Vec<TypedExpr>, String> {
+        // global signatures and memory layouts
         for expr in program {
-            if let Expr::FnDecl(name, params, ret_type, _) = expr {
-                let param_types = params.iter().map(|(_, t)| t.clone()).collect();
-                self.functions
-                    .insert(name.clone(), (param_types, ret_type.clone()));
+            match expr {
+                Expr::FnDecl(name, params, ret_type, _) => {
+                    let param_types = params.iter().map(|(_, t)| t.clone()).collect();
+                    self.functions
+                        .insert(name.clone(), (param_types, ret_type.clone()));
+                }
+                Expr::StructDecl(name, fields) => {
+                    let mut layout = HashMap::new();
+                    let mut offset:i32 = 0;
+                    for (f_name, f_ty) in fields {
+                        layout.insert(f_name.clone(), (f_ty.clone(), offset));
+                        offset += 8;
+                    }
+                    self.structs.insert(
+                        name.clone(),
+                        StructLayout {
+                            size: offset as u32,
+                            fields: layout,
+                        },
+                    );
+                }
+                _ => {}
             }
         }
 
@@ -125,7 +158,6 @@ impl TypeChecker {
 
                 self.variables.insert(name.clone(), resolved_type.clone());
 
-                // MIR TypedExpr::Let still takes a strict, known Type.
                 Ok(TypedExpr::Let(
                     name.clone(),
                     resolved_type,
@@ -141,7 +173,7 @@ impl TypeChecker {
 
                 let mut typed_value = self.check_expr(value)?;
 
-                // Literal type coercion
+                // literal type coercion
                 if let TypedExpr::Number(n, _) = &mut typed_value {
                     if var_type.is_integer_type() {
                         typed_value = TypedExpr::Number(*n, var_type.clone());
@@ -322,6 +354,69 @@ impl TypeChecker {
                     params.clone(),
                     ret_type.clone(),
                     Box::new(t_body),
+                ))
+            }
+            Expr::StructDecl(name, fields) => {
+                Ok(TypedExpr::StructDecl(name.clone(), fields.clone()))
+            }
+            Expr::StructInit(name, fields) => {
+                let layout = self
+                    .structs
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| format!("Type Error: Unknown struct '{}'", name))?;
+
+                let mut t_fields = Vec::new();
+                for (f_name, f_val) in fields {
+                    let mut t_val = self.check_expr(f_val)?;
+
+                    let (expected_ty, _) = layout.fields.get(f_name).ok_or_else(|| {
+                        format!("Type Error: '{}' has no field '{}'", name, f_name)
+                    })?;
+
+                    // coerce literal numbers to match the struct definition
+                    if let TypedExpr::Number(n, _) = &mut t_val {
+                        if expected_ty.is_integer_type() {
+                            t_val = TypedExpr::Number(*n, expected_ty.clone());
+                        }
+                    }
+
+                    if t_val.ty() != *expected_ty {
+                        return Err(format!(
+                            "Type Error: Field '{}' expects {:?}, got {:?}",
+                            f_name,
+                            expected_ty,
+                            t_val.ty()
+                        ));
+                    }
+                    t_fields.push((f_name.clone(), Box::new(t_val)));
+                }
+                Ok(TypedExpr::StructInit(name.clone(), t_fields))
+            }
+            Expr::FieldAccess(base, field_name) => {
+                let t_base = self.check_expr(base)?;
+
+                // ensure the variable we are applying '.' to is actually a custom struct
+                let Type::Custom(struct_name) = t_base.ty() else {
+                    return Err(format!(
+                        "Type Error: Cannot access field '{}' on primitive type {:?}",
+                        field_name,
+                        t_base.ty()
+                    ));
+                };
+
+                let layout = self.structs.get(&struct_name).unwrap();
+                let (f_ty, _offset) = layout.fields.get(field_name).ok_or_else(|| {
+                    format!(
+                        "Type Error: Struct '{}' has no field '{}'",
+                        struct_name, field_name
+                    )
+                })?;
+
+                Ok(TypedExpr::FieldAccess(
+                    Box::new(t_base),
+                    field_name.clone(),
+                    f_ty.clone(),
                 ))
             }
         }

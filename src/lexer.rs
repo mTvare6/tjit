@@ -14,6 +14,7 @@ pub enum Token {
     Multiply,
     Divide,
     Assign,
+    Dot,
 
     // Keywords
     Let,
@@ -23,6 +24,7 @@ pub enum Token {
     Break,
     Continue,
     Fn,
+    Struct,
 
     // Relational
     LessThan,
@@ -101,6 +103,7 @@ impl<'a> Lexer<'a> {
             "break" => Token::Break,
             "loop" => Token::Loop,
             "fn" => Token::Fn,
+            "struct" => Token::Struct,
             _ => Token::Identifier(ident),
         }
     }
@@ -139,6 +142,10 @@ impl<'a> Lexer<'a> {
                 ':' => {
                     self.chars.next();
                     return Token::Colon;
+                }
+                '.' => {
+                    self.chars.next();
+                    return Token::Dot;
                 }
                 '=' => {
                     self.chars.next();

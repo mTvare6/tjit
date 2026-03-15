@@ -1,5 +1,5 @@
 use crate::parser::{Op, Type};
-use crate::type_system::TypedExpr;
+use crate::type_system::{StructLayout, TypedExpr};
 use cranelift::prelude::*;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
@@ -16,6 +16,7 @@ macro_rules! emit_binary_op {
             Type::I8 | Type::I16 | Type::I32 | Type::I64 => $builder.ins().$int_op($lhs, $rhs),
             Type::U8 | Type::U16 | Type::U32 | Type::U64 => $builder.ins().$uint_op($lhs, $rhs),
             Type::F32 | Type::F64 => $builder.ins().$float_op($lhs, $rhs),
+            Type::Custom(_) => panic!("Fatal: Cannot perform arithmetic operations on structs"),
         }
     };
 }
@@ -36,6 +37,7 @@ macro_rules! emit_cmp_op {
                 let b = $builder.ins().fcmp(FloatCC::$float_cc, $lhs, $rhs);
                 $builder.ins().uextend(types::I64, b)
             }
+            Type::Custom(_) => panic!("Fatal: Cannot compare raw struct memory directly"),
         }
     };
 }
@@ -75,6 +77,7 @@ impl JITEngine {
         params: &[(String, Type)],
         ret_ty: &Type,
         body: &TypedExpr,
+        structs: &HashMap<String, StructLayout>,
     ) -> Result<(), String> {
         self.module.clear_context(&mut self.ctx);
 
@@ -119,6 +122,7 @@ impl JITEngine {
             &mut variables,
             &mut variable_index,
             &mut loop_stack,
+            &structs,
         )
         .unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
 
@@ -145,11 +149,32 @@ impl JITEngine {
 
     pub fn compile(&mut self, program: &[TypedExpr]) -> Result<fn() -> i64, String> {
         // global function compilation
+        let mut structs = HashMap::new();
         for expr in program {
-            if let TypedExpr::FnDecl(name, params, ret_ty, body) = expr {
-                self.compile_function(name, params, ret_ty, body)?;
+            if let TypedExpr::StructDecl(name, fields) = expr {
+                let mut layout = HashMap::new();
+                let mut offset = 0;
+                for (f_name, f_ty) in fields {
+                    layout.insert(f_name.clone(), (f_ty.clone(), offset));
+                    offset += 8; // Force 8-byte alignment for all fields
+                }
+                structs.insert(
+                    name.clone(),
+                    StructLayout {
+                        size: offset as u32,
+                        fields: layout,
+                    },
+                );
             }
         }
+
+
+        for expr in program {
+            if let TypedExpr::FnDecl(name, params, ret_ty, body) = expr {
+                self.compile_function(name, params, ret_ty, body, &structs)?;
+            }
+        }
+
 
         self.module.clear_context(&mut self.ctx);
         self.ctx
@@ -176,7 +201,7 @@ impl JITEngine {
 
         for expr in program {
             // bypass function declarations during the local pass
-            if matches!(expr, TypedExpr::FnDecl(..)) {
+            if matches!(expr, TypedExpr::FnDecl(..) | TypedExpr::StructDecl(..)) {
                 continue;
             }
             if let Some(val) = Self::compile_expr(
@@ -186,6 +211,7 @@ impl JITEngine {
                 &mut variables,
                 &mut variable_index,
                 &mut loop_stack,
+                &structs,
             ) {
                 return_val = val;
                 final_type = expr.ty(); // track the type of the last evaluation
@@ -243,6 +269,7 @@ impl JITEngine {
         variables: &mut VariableMap,
         variable_index: &mut usize,
         loop_stack: &mut LoopStack,
+        structs: &HashMap<String, StructLayout>,
     ) -> Option<Value> {
         match expr {
             TypedExpr::Number(n, num_ty) => {
@@ -258,6 +285,7 @@ impl JITEngine {
                     variables,
                     variable_index,
                     loop_stack,
+                    structs,
                 )?;
                 let rhs = Self::compile_expr(
                     right,
@@ -266,6 +294,7 @@ impl JITEngine {
                     variables,
                     variable_index,
                     loop_stack,
+                    structs,
                 )?;
 
                 Some(match op {
@@ -327,6 +356,7 @@ impl JITEngine {
                     variables,
                     variable_index,
                     loop_stack,
+                    structs,
                 )?;
                 let var = Variable::new(*variable_index);
                 *variable_index += 1;
@@ -345,6 +375,7 @@ impl JITEngine {
                     variables,
                     variable_index,
                     loop_stack,
+                    structs,
                 )?;
                 variables
                     .get(name)
@@ -360,6 +391,7 @@ impl JITEngine {
                     variables,
                     variable_index,
                     loop_stack,
+                    structs,
                 )?;
 
                 let then_block = builder.create_block();
@@ -382,6 +414,7 @@ impl JITEngine {
                     variables,
                     variable_index,
                     loop_stack,
+                    structs,
                 );
                 if let Some(val) = then_val {
                     builder.ins().jump(merge_block, &[val]);
@@ -396,6 +429,7 @@ impl JITEngine {
                     variables,
                     variable_index,
                     loop_stack,
+                    structs,
                 );
                 if let Some(val) = else_val {
                     builder.ins().jump(merge_block, &[val]);
@@ -429,6 +463,7 @@ impl JITEngine {
                     variables,
                     variable_index,
                     loop_stack,
+                    structs,
                 );
                 if inner_val.is_some() {
                     builder.ins().jump(header_block, &[]);
@@ -450,6 +485,7 @@ impl JITEngine {
                     variables,
                     variable_index,
                     loop_stack,
+                    structs,
                 )?;
                 // dummy value to satisfy the type system
                 builder.ins().jump(loop_end, &[val]);
@@ -470,6 +506,7 @@ impl JITEngine {
                         variables,
                         variable_index,
                         loop_stack,
+                        structs,
                     );
                     // if an expression diverged, don't compile the rest of the block (illegal)
                     if last_val.is_none() {
@@ -504,6 +541,7 @@ impl JITEngine {
                         variables,
                         variable_index,
                         loop_stack,
+                        structs,
                     )?);
                 }
 
@@ -514,6 +552,65 @@ impl JITEngine {
             TypedExpr::FnDecl(..) => {
                 // ignore inside compile_expr we process these at the top level
                 Some(builder.ins().iconst(types::I64, 0))
+            }
+            TypedExpr::StructDecl(..) => {
+                // requires no runtime execution
+                Some(builder.ins().iconst(types::I64, 0))
+            }
+            TypedExpr::StructInit(name, fields) => {
+                let layout = structs.get(name).unwrap();
+
+                // allocate a contiguous block on the call stack
+                let slot_data = StackSlotData::new(StackSlotKind::ExplicitSlot, layout.size);
+                let slot = builder.create_sized_stack_slot(slot_data);
+
+                // get physical memory pointer to the start of the struct
+                let base_ptr = builder.ins().stack_addr(types::I64, slot, 0);
+
+                // store at the correct byte offset
+                for (f_name, f_expr) in fields {
+                    let val = Self::compile_expr(
+                        f_expr,
+                        module,
+                        builder,
+                        variables,
+                        variable_index,
+                        loop_stack,
+                        structs,
+                    )?;
+                    let (_, offset) = layout.fields.get(f_name).unwrap();
+
+                    builder.ins().store(MemFlags::new(), val, base_ptr, *offset);
+                }
+
+                Some(base_ptr)
+            }
+            TypedExpr::FieldAccess(base, f_name, f_ty) => {
+                // get the base and later return the memory pointer (base_ptr) of the struct
+                let base_ptr = Self::compile_expr(
+                    base,
+                    module,
+                    builder,
+                    variables,
+                    variable_index,
+                    loop_stack,
+                    structs,
+                )?;
+
+                let Type::Custom(struct_name) = base.ty() else {
+                    panic!("Fatal: Attempted field access on non-struct pointer");
+                };
+
+                let layout = structs.get(&struct_name).unwrap();
+                let (_, offset) = layout.fields.get(f_name).unwrap();
+
+                // load directly from base_pointer + byte_offset
+                let cl_type = f_ty.into();
+                let val = builder
+                    .ins()
+                    .load(cl_type, MemFlags::new(), base_ptr, *offset);
+
+                Some(val)
             }
         }
     }

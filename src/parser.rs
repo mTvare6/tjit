@@ -16,9 +16,12 @@ pub enum Expr {
     Call(String, Vec<Expr>),
     Block(Vec<Expr>),
     Continue,
+    StructDecl(String, Vec<(String, Type)>),
+    StructInit(String, Vec<(String, Box<Expr>)>),
+    FieldAccess(Box<Expr>, String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Type {
     I8,
     I16,
@@ -30,6 +33,7 @@ pub enum Type {
     U64,
     F32,
     F64,
+    Custom(String),
 }
 
 impl Into<types::Type> for &Type {
@@ -41,6 +45,7 @@ impl Into<types::Type> for &Type {
             Type::I64 | Type::U64 => types::I64,
             Type::F32 => types::F32,
             Type::F64 => types::F64,
+            Type::Custom(..) => types::I64,
         }
     }
 }
@@ -88,7 +93,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_primary(&mut self) -> Option<Expr> {
-        match self.peek()? {
+        let expr = match self.peek()? {
             Token::Number(n) => {
                 let val = *n;
                 self.next();
@@ -125,12 +130,55 @@ impl<'a> Parser<'a> {
                         panic!("Expected ')' after arguments")
                     };
                     Some(Expr::Call(var_name, args))
+                } else if self.peek() == Some(&Token::LBrace) {
+                    self.next();
+                    let mut fields = Vec::new();
+
+                    if self.peek() != Some(&Token::RBrace) {
+                        loop {
+                            let field_name = match self.next() {
+                                Some(Token::Identifier(n)) => n.clone(),
+                                _ => panic!("Expected field name"),
+                            };
+                            let Some(Token::Colon) = self.next() else {
+                                panic!("Expected ':'")
+                            };
+
+                            let field_value =
+                                self.parse_expression().expect("Expected field value");
+                            fields.push((field_name, Box::new(field_value)));
+
+                            if self.peek() == Some(&Token::Comma) {
+                                self.next();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    let Some(Token::RBrace) = self.next() else {
+                        panic!("Expected '}}'")
+                    };
+                    Some(Expr::StructInit(var_name, fields))
                 } else {
                     Some(Expr::Variable(var_name))
                 }
             }
             _ => None,
+        };
+
+        let mut expr = expr?;
+        while self.peek() == Some(&Token::Dot) {
+            self.next();
+
+            let field_name = match self.next() {
+                Some(Token::Identifier(name)) => name.clone(),
+                _ => panic!("Expected field name after '.'"),
+            };
+
+            expr = Expr::FieldAccess(Box::new(expr), field_name);
         }
+
+        Some(expr)
     }
 
     fn parse_type(&mut self) -> Type {
@@ -146,7 +194,7 @@ impl<'a> Parser<'a> {
                 "u64" => Type::U64,
                 "f32" => Type::F32,
                 "f64" => Type::F64,
-                _ => panic!("Unknown type: {}", type_name),
+                _ => Type::Custom(type_name.clone()),
             };
             self.next();
             ty
@@ -199,8 +247,8 @@ impl<'a> Parser<'a> {
         Some(left)
     }
 
-pub fn parse_var_decl(&mut self) -> Option<Expr> {
-        self.next(); // Consume 'let'
+    pub fn parse_var_decl(&mut self) -> Option<Expr> {
+        self.next();
 
         let name = match self.next() {
             Some(Token::Identifier(n)) => n.clone(),
@@ -223,10 +271,52 @@ pub fn parse_var_decl(&mut self) -> Option<Expr> {
         Some(Expr::Let(name, var_type, Box::new(value)))
     }
 
+    fn parse_struct_decl(&mut self) -> Option<Expr> {
+        self.next();
+
+        let name = match self.next() {
+            Some(Token::Identifier(n)) => n.clone(),
+            _ => panic!("Expected struct name"),
+        };
+
+        let Some(Token::LBrace) = self.next() else {
+            panic!("Expected '{{' after struct name")
+        };
+
+        let mut fields = Vec::new();
+        while self.peek() != Some(&Token::RBrace) {
+            let field_name = match self.next() {
+                Some(Token::Identifier(n)) => n.clone(),
+                _ => panic!("Expected field name"),
+            };
+
+            let Some(Token::Colon) = self.next() else {
+                panic!("Expected ':' after field name")
+            };
+
+            let field_type = self.parse_type();
+
+            fields.push((field_name, field_type));
+
+            if self.peek() == Some(&Token::Comma) {
+                self.next();
+            } else {
+                break;
+            }
+        }
+
+        let Some(Token::RBrace) = self.next() else {
+            panic!("Expected '}}' at end of struct")
+        };
+
+        Some(Expr::StructDecl(name, fields))
+    }
+
     pub fn parse_declaration(&mut self) -> Option<Expr> {
         match self.peek() {
             Some(Token::Fn) => self.parse_fn_decl(),
             Some(Token::Let) => self.parse_var_decl(),
+            Some(Token::Struct) => self.parse_struct_decl(),
             _ => self.parse_expression(),
         }
     }
