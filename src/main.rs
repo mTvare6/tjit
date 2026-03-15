@@ -1,10 +1,12 @@
-mod lexer;
 mod jit;
+mod lexer;
 mod parser;
+mod type_system;
 
 use jit::JITEngine;
-use parser::Parser;
 use lexer::Lexer;
+use parser::Parser;
+use type_system::TypeChecker;
 
 // Read the entire source code from stdin until EOF with prompt
 fn read_source() -> String {
@@ -33,14 +35,22 @@ fn main() {
     println!();
     let mut lexer = Lexer::new(&source);
     let tokens = lexer.collect_tokens();
+
     let mut parser = Parser::new(&tokens);
     let ast = parser.parse();
 
     // println!("{:#?}", ast);
 
+    let mut typechecker = TypeChecker::new();
+    let ty_result = typechecker.check_program(&ast);
+
+    let typed_ast = ty_result.unwrap_or_else(|e| panic!("{}", e));
+
+    // println!("{:#?}", typed_ast);
+
     let mut jit = JITEngine::new();
 
-    match jit.compile(&ast) {
+    match jit.compile(&typed_ast) {
         Ok(jit_fn) => {
             let result = jit_fn();
             println!("{}", result);

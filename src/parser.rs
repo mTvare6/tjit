@@ -1,22 +1,51 @@
 use crate::lexer::Token;
+use cranelift::prelude::types;
 
 #[derive(Debug)]
 pub enum Expr {
     Number(i64),
+    Float(f64),
     BinaryOp(Box<Expr>, Op, Box<Expr>),
     Variable(String),
-    Let(String, Box<Expr>),
+    Let(String, Type, Box<Expr>),
     If(Box<Expr>, Box<Expr>, Box<Expr>),
     Loop(Box<Expr>),
     Assign(String, Box<Expr>),
     Break(Box<Expr>),
-    FnDecl(String, Vec<String>, Box<Expr>),
+    FnDecl(String, Vec<(String, Type)>, Type, Box<Expr>),
     Call(String, Vec<Expr>),
     Block(Vec<Expr>),
     Continue,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Type {
+    I8,
+    I16,
+    I32,
+    I64,
+    U8,
+    U16,
+    U32,
+    U64,
+    F32,
+    F64,
+}
+
+impl Into<types::Type> for &Type {
+    fn into(self) -> types::Type {
+        match self {
+            Type::I8 | Type::U8 => types::I8,
+            Type::I16 | Type::U16 => types::I16,
+            Type::I32 | Type::U32 => types::I32,
+            Type::I64 | Type::U64 => types::I64,
+            Type::F32 => types::F32,
+            Type::F64 => types::F64,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 pub enum Op {
     Add,
     Subtract,
@@ -65,6 +94,11 @@ impl<'a> Parser<'a> {
                 self.next();
                 Some(Expr::Number(val))
             }
+            Token::Float(f) => {
+                let val = *f;
+                self.next();
+                Some(Expr::Float(val))
+            }
             Token::Identifier(name) => {
                 let var_name = name.clone();
                 self.next();
@@ -96,6 +130,28 @@ impl<'a> Parser<'a> {
                 }
             }
             _ => None,
+        }
+    }
+
+    fn parse_type(&mut self) -> Type {
+        if let Some(Token::Identifier(type_name)) = self.peek() {
+            let ty = match type_name.as_str() {
+                "i8" => Type::I8,
+                "i16" => Type::I16,
+                "i32" => Type::I32,
+                "i64" => Type::I64,
+                "u8" => Type::U8,
+                "u16" => Type::U16,
+                "u32" => Type::U32,
+                "u64" => Type::U64,
+                "f32" => Type::F32,
+                "f64" => Type::F64,
+                _ => panic!("Unknown type: {}", type_name),
+            };
+            self.next();
+            ty
+        } else {
+            panic!("Expected type identifier");
         }
     }
 
@@ -151,14 +207,19 @@ impl<'a> Parser<'a> {
             _ => panic!("Expected variable name after 'let'"),
         };
 
-        match self.next() {
-            Some(Token::Assign) => {}
-            _ => panic!("Expected '=' after variable name"),
-        }
+        let Some(Token::Colon) = self.next() else {
+            panic!("Expected ':' after variable name");
+        };
+
+        let var_type = self.parse_type();
+
+        let Some(Token::Assign) = self.next() else {
+            panic!("Expected ':' after variable name");
+        };
 
         let value = self.parse_expression()?;
 
-        Some(Expr::Let(name, Box::new(value)))
+        Some(Expr::Let(name, var_type, Box::new(value)))
     }
 
     pub fn parse_declaration(&mut self) -> Option<Expr> {
@@ -293,10 +354,18 @@ impl<'a> Parser<'a> {
         let mut params = Vec::new();
         if self.peek() != Some(&Token::RParen) {
             loop {
-                match self.next() {
-                    Some(Token::Identifier(p)) => params.push(p.clone()),
+                let param_name = match self.next() {
+                    Some(Token::Identifier(p)) => p.clone(),
                     _ => panic!("Expected parameter name"),
-                }
+                };
+
+                let Some(Token::Colon) = self.next() else {
+                    panic!("Expected ':' after parameter name");
+                };
+
+                let param_ty = self.parse_type();
+
+                params.push((param_name, param_ty));
 
                 if self.peek() == Some(&Token::Comma) {
                     self.next();
@@ -310,9 +379,15 @@ impl<'a> Parser<'a> {
             panic!("Expected ')' after parameters")
         };
 
+        let Some(Token::Arrow) = self.next() else {
+            panic!("Expected '->' after function signature")
+        };
+
+        let return_type = self.parse_type();
+
         let body = self.parse_block()?;
 
-        Some(Expr::FnDecl(name, params, Box::new(body)))
+        Some(Expr::FnDecl(name, params, return_type, Box::new(body)))
     }
 
     pub fn parse(&mut self) -> Vec<Expr> {

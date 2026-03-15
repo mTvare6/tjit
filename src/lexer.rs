@@ -5,6 +5,7 @@ use std::str::Chars;
 pub enum Token {
     // Data
     Number(i64),
+    Float(f64),
     Identifier(String),
 
     // Operators
@@ -22,7 +23,6 @@ pub enum Token {
     Break,
     Continue,
     Fn,
-    Comma,
 
     // Relational
     LessThan,
@@ -39,6 +39,9 @@ pub enum Token {
     RParen,
     LBrace,
     RBrace,
+    Comma,
+    Colon,
+    Arrow,
 }
 
 pub struct Lexer<'a> {
@@ -53,16 +56,27 @@ impl<'a> Lexer<'a> {
     }
 
     fn lex_number(&mut self) -> Token {
-        let mut number = 0;
+        let mut number_str = String::new();
+        let mut is_float = false;
+
         while let Some(&ch) = self.chars.peek() {
             if ch.is_digit(10) {
-                number = number * 10 + ch.to_digit(10).unwrap() as i64;
+                number_str.push(ch);
+                self.chars.next();
+            } else if ch == '.' && !is_float {
+                is_float = true;
+                number_str.push(ch);
                 self.chars.next();
             } else {
                 break;
             }
         }
-        Token::Number(number)
+
+        if is_float {
+            Token::Float(number_str.parse::<f64>().unwrap())
+        } else {
+            Token::Number(number_str.parse::<i64>().unwrap())
+        }
     }
 
     fn read_ident(&mut self) -> String {
@@ -104,6 +118,10 @@ impl<'a> Lexer<'a> {
                 }
                 '-' => {
                     self.chars.next();
+                    if self.chars.peek() == Some(&'>') {
+                        self.chars.next();
+                        return Token::Arrow;
+                    }
                     return Token::Minus;
                 }
                 '*' => {
@@ -117,6 +135,10 @@ impl<'a> Lexer<'a> {
                 ',' => {
                     self.chars.next();
                     return Token::Comma;
+                }
+                ':' => {
+                    self.chars.next();
+                    return Token::Colon;
                 }
                 '=' => {
                     self.chars.next();

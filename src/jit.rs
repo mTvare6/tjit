@@ -1,4 +1,5 @@
-use crate::parser::{Expr, Op};
+use crate::parser::{Op, Type};
+use crate::type_system::TypedExpr;
 use cranelift::prelude::*;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
@@ -7,6 +8,37 @@ use std::mem;
 
 type LoopStack = Vec<(Block, Block)>;
 type VariableMap = HashMap<String, Variable>;
+
+// for selecting arithmetic instructions
+macro_rules! emit_binary_op {
+    ($builder:expr, $ty:expr, $lhs:expr, $rhs:expr, $int_op:ident, $uint_op:ident, $float_op:ident) => {
+        match $ty {
+            Type::I8 | Type::I16 | Type::I32 | Type::I64 => $builder.ins().$int_op($lhs, $rhs),
+            Type::U8 | Type::U16 | Type::U32 | Type::U64 => $builder.ins().$uint_op($lhs, $rhs),
+            Type::F32 | Type::F64 => $builder.ins().$float_op($lhs, $rhs),
+        }
+    };
+}
+
+// for selecting relational conditional instructions
+macro_rules! emit_cmp_op {
+    ($builder:expr, $ty:expr, $lhs:expr, $rhs:expr, $int_cc:ident, $uint_cc:ident, $float_cc:ident) => {
+        match $ty {
+            Type::I8 | Type::I16 | Type::I32 | Type::I64 => {
+                let b = $builder.ins().icmp(IntCC::$int_cc, $lhs, $rhs);
+                $builder.ins().uextend(types::I64, b)
+            }
+            Type::U8 | Type::U16 | Type::U32 | Type::U64 => {
+                let b = $builder.ins().icmp(IntCC::$uint_cc, $lhs, $rhs);
+                $builder.ins().uextend(types::I64, b)
+            }
+            Type::F32 | Type::F64 => {
+                let b = $builder.ins().fcmp(FloatCC::$float_cc, $lhs, $rhs);
+                $builder.ins().uextend(types::I64, b)
+            }
+        }
+    };
+}
 
 pub struct JITEngine {
     builder_ctx: FunctionBuilderContext,
@@ -40,24 +72,23 @@ impl JITEngine {
     fn compile_function(
         &mut self,
         name: &str,
-        params: &[String],
-        body: &Expr,
+        params: &[(String, Type)],
+        ret_ty: &Type,
+        body: &TypedExpr,
     ) -> Result<(), String> {
         self.module.clear_context(&mut self.ctx);
 
-        for _ in params {
-            self.ctx
-                .func
-                .signature
-                .params
-                .push(AbiParam::new(types::I64));
+        for (_, param_type) in params {
+            let cl_type = param_type.into();
+            self.ctx.func.signature.params.push(AbiParam::new(cl_type));
         }
 
+        let cl_ret_type = ret_ty.into();
         self.ctx
             .func
             .signature
             .returns
-            .push(AbiParam::new(types::I64));
+            .push(AbiParam::new(cl_ret_type));
 
         let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.builder_ctx);
 
@@ -71,11 +102,12 @@ impl JITEngine {
         let mut variable_index = 0;
         let mut loop_stack = Vec::new();
 
-        for (i, param_name) in params.iter().enumerate() {
+        for (i, (param_name, param_ty)) in params.iter().enumerate() {
             let val = builder.block_params(entry_block)[i];
             let var = Variable::new(variable_index);
             variable_index += 1;
-            builder.declare_var(var, types::I64);
+            let cl_type = param_ty.into();
+            builder.declare_var(var, cl_type);
             builder.def_var(var, val);
             variables.insert(param_name.clone(), var);
         }
@@ -111,11 +143,11 @@ impl JITEngine {
         Ok(())
     }
 
-    pub fn compile(&mut self, program: &[Expr]) -> Result<fn() -> i64, String> {
+    pub fn compile(&mut self, program: &[TypedExpr]) -> Result<fn() -> i64, String> {
         // global function compilation
         for expr in program {
-            if let Expr::FnDecl(name, params, body) = expr {
-                self.compile_function(name, params, body)?;
+            if let TypedExpr::FnDecl(name, params, ret_ty, body) = expr {
+                self.compile_function(name, params, ret_ty, body)?;
             }
         }
 
@@ -140,13 +172,13 @@ impl JITEngine {
 
         // default return value
         let mut return_val = builder.ins().iconst(types::I64, 0);
+        let mut final_type = Type::I64;
 
         for expr in program {
             // bypass function declarations during the local pass
-            if matches!(expr, Expr::FnDecl(..)) {
+            if matches!(expr, TypedExpr::FnDecl(..)) {
                 continue;
             }
-
             if let Some(val) = Self::compile_expr(
                 expr,
                 &mut self.module,
@@ -155,8 +187,26 @@ impl JITEngine {
                 &mut variable_index,
                 &mut loop_stack,
             ) {
-                return_val = val; // update return value to the last expression's value
+                return_val = val;
+                final_type = expr.ty(); // track the type of the last evaluation
             }
+        }
+
+        // ABI coercion, force the final value to match the `i64` return signature
+        match final_type {
+            Type::F32 | Type::F64 => {
+                // convert float to signed integer
+                return_val = builder.ins().fcvt_to_sint(types::I64, return_val);
+            }
+            Type::I8 | Type::I16 | Type::I32 => {
+                // sign-extend smaller integers to 64-bit
+                return_val = builder.ins().sextend(types::I64, return_val);
+            }
+            Type::U8 | Type::U16 | Type::U32 => {
+                // zero-extend unsigned integers to 64-bit
+                return_val = builder.ins().uextend(types::I64, return_val);
+            }
+            _ => {} // I64 and U64 require no width coercion
         }
 
         // emit the return instruction (the `}` of the function)
@@ -187,7 +237,7 @@ impl JITEngine {
     }
 
     fn compile_expr(
-        expr: &Expr,
+        expr: &TypedExpr,
         module: &mut JITModule,
         builder: &mut FunctionBuilder,
         variables: &mut VariableMap,
@@ -195,8 +245,12 @@ impl JITEngine {
         loop_stack: &mut LoopStack,
     ) -> Option<Value> {
         match expr {
-            Expr::Number(n) => Some(builder.ins().iconst(types::I64, *n)),
-            Expr::BinaryOp(left, op, right) => {
+            TypedExpr::Number(n, num_ty) => {
+                let cl_type = num_ty.into();
+                Some(builder.ins().iconst(cl_type, *n))
+            }
+            TypedExpr::Float(f) => Some(builder.ins().f64const(*f)),
+            TypedExpr::BinaryOp(left, op, right, op_type) => {
                 let lhs = Self::compile_expr(
                     left,
                     module,
@@ -215,42 +269,57 @@ impl JITEngine {
                 )?;
 
                 Some(match op {
-                    Op::Add => builder.ins().iadd(lhs, rhs),
-                    Op::Subtract => builder.ins().isub(lhs, rhs),
-                    Op::Multiply => builder.ins().imul(lhs, rhs),
-                    Op::Divide => builder.ins().sdiv(lhs, rhs),
-                    Op::Eq => {
-                        let bool_val = builder.ins().icmp(IntCC::Equal, lhs, rhs);
-                        builder.ins().uextend(types::I64, bool_val)
-                    }
-                    Op::Lt => {
-                        let bool_val = builder.ins().icmp(IntCC::SignedLessThan, lhs, rhs);
-                        builder.ins().uextend(types::I64, bool_val)
-                    }
-                    Op::Le => {
-                        let bool_val = builder.ins().icmp(IntCC::SignedLessThanOrEqual, lhs, rhs);
-                        builder.ins().uextend(types::I64, bool_val)
-                    }
-                    Op::Gt => {
-                        let bool_val = builder.ins().icmp(IntCC::SignedGreaterThan, lhs, rhs);
-                        builder.ins().uextend(types::I64, bool_val)
-                    }
-                    Op::Ge => {
-                        let bool_val =
-                            builder
-                                .ins()
-                                .icmp(IntCC::SignedGreaterThanOrEqual, lhs, rhs);
-                        builder.ins().uextend(types::I64, bool_val)
-                    }
+                    Op::Add => emit_binary_op!(builder, op_type, lhs, rhs, iadd, iadd, fadd),
+                    Op::Subtract => emit_binary_op!(builder, op_type, lhs, rhs, isub, isub, fsub),
+                    Op::Multiply => emit_binary_op!(builder, op_type, lhs, rhs, imul, imul, fmul),
+                    Op::Divide => emit_binary_op!(builder, op_type, lhs, rhs, sdiv, udiv, fdiv),
+
+                    Op::Eq => emit_cmp_op!(builder, op_type, lhs, rhs, Equal, Equal, Equal),
+                    Op::Lt => emit_cmp_op!(
+                        builder,
+                        op_type,
+                        lhs,
+                        rhs,
+                        SignedLessThan,
+                        UnsignedLessThan,
+                        LessThan
+                    ),
+                    Op::Le => emit_cmp_op!(
+                        builder,
+                        op_type,
+                        lhs,
+                        rhs,
+                        SignedLessThanOrEqual,
+                        UnsignedLessThanOrEqual,
+                        LessThanOrEqual
+                    ),
+                    Op::Gt => emit_cmp_op!(
+                        builder,
+                        op_type,
+                        lhs,
+                        rhs,
+                        SignedGreaterThan,
+                        UnsignedGreaterThan,
+                        GreaterThan
+                    ),
+                    Op::Ge => emit_cmp_op!(
+                        builder,
+                        op_type,
+                        lhs,
+                        rhs,
+                        SignedGreaterThanOrEqual,
+                        UnsignedGreaterThanOrEqual,
+                        GreaterThanOrEqual
+                    ),
                 })
             }
-            Expr::Variable(name) => Some(
+            TypedExpr::Variable(name, _) => Some(
                 variables
                     .get(name)
                     .map(|var| builder.use_var(*var))
                     .unwrap_or_else(|| panic!("Undefined variable: {}", name)),
             ),
-            Expr::Let(name, value) => {
+            TypedExpr::Let(name, declared_ty, value) => {
                 let val = Self::compile_expr(
                     value,
                     module,
@@ -261,12 +330,14 @@ impl JITEngine {
                 )?;
                 let var = Variable::new(*variable_index);
                 *variable_index += 1;
-                builder.declare_var(var, types::I64);
+
+                let cl_type = declared_ty.into();
+                builder.declare_var(var, cl_type);
                 builder.def_var(var, val);
                 variables.insert(name.clone(), var);
                 Some(val) // return of let is the value assigned
             }
-            Expr::Assign(name, value) => {
+            TypedExpr::Assign(name, value, _) => {
                 let val = Self::compile_expr(
                     value,
                     module,
@@ -281,7 +352,7 @@ impl JITEngine {
                     .unwrap_or_else(|| panic!("Undefined variable: {}", name));
                 Some(val)
             }
-            Expr::If(cond, then_branch, else_branch) => {
+            TypedExpr::If(cond, then_branch, else_branch, branch_type) => {
                 let cond_val = Self::compile_expr(
                     cond,
                     module,
@@ -295,7 +366,8 @@ impl JITEngine {
                 let else_block = builder.create_block();
                 let merge_block = builder.create_block();
 
-                builder.append_block_param(merge_block, types::I64);
+                let cl_type = branch_type.into();
+                builder.append_block_param(merge_block, cl_type);
 
                 builder
                     .ins()
@@ -311,7 +383,6 @@ impl JITEngine {
                     variable_index,
                     loop_stack,
                 );
-
                 if let Some(val) = then_val {
                     builder.ins().jump(merge_block, &[val]);
                 }
@@ -326,7 +397,6 @@ impl JITEngine {
                     variable_index,
                     loop_stack,
                 );
-
                 if let Some(val) = else_val {
                     builder.ins().jump(merge_block, &[val]);
                 }
@@ -340,13 +410,14 @@ impl JITEngine {
                     Some(builder.block_params(merge_block)[0])
                 }
             }
-            Expr::Loop(body) => {
+            TypedExpr::Loop(body, loop_ty) => {
                 let header_block = builder.create_block();
                 let exit_block = builder.create_block();
 
                 loop_stack.push((header_block, exit_block));
 
-                builder.append_block_param(exit_block, types::I64);
+                let cl_type = loop_ty.into();
+                builder.append_block_param(exit_block, cl_type);
 
                 builder.ins().jump(header_block, &[]);
                 builder.switch_to_block(header_block);
@@ -359,26 +430,19 @@ impl JITEngine {
                     variable_index,
                     loop_stack,
                 );
-
                 if inner_val.is_some() {
                     builder.ins().jump(header_block, &[]);
                 }
 
                 loop_stack.pop();
-
                 builder.switch_to_block(exit_block);
-
                 builder.seal_block(header_block);
                 builder.seal_block(exit_block);
 
                 Some(builder.block_params(exit_block)[0])
             }
-            Expr::Break(body) => {
-                let loop_end = match loop_stack.last() {
-                    Some((_, end)) => *end,
-                    None => panic!("'break' used outside of a loop"),
-                };
-
+            TypedExpr::Break(body) => {
+                let loop_end = loop_stack.last().unwrap().1;
                 let val = Self::compile_expr(
                     body,
                     module,
@@ -387,21 +451,16 @@ impl JITEngine {
                     variable_index,
                     loop_stack,
                 )?;
-
                 // dummy value to satisfy the type system
                 builder.ins().jump(loop_end, &[val]);
-
                 None
             }
-            Expr::Continue => {
-                if let Some((loop_start, _)) = loop_stack.last() {
-                    builder.ins().jump(*loop_start, &[]);
-                    None
-                } else {
-                    panic!("'continue' used outside of a loop");
-                }
+            TypedExpr::Continue => {
+                let loop_start = loop_stack.last().unwrap().0;
+                builder.ins().jump(loop_start, &[]);
+                None
             }
-            Expr::Block(exprs) => {
+            TypedExpr::Block(exprs, _) => {
                 let mut last_val = None;
                 for e in exprs {
                     last_val = Self::compile_expr(
@@ -419,18 +478,19 @@ impl JITEngine {
                 }
                 last_val
             }
-            Expr::Call(name, args) => {
+            TypedExpr::Call(name, args, ret_ty) => {
                 let mut sig = module.make_signature();
-                for _ in args {
-                    sig.params.push(AbiParam::new(types::I64));
+                for arg in args {
+                    let cl_type = (&arg.ty()).into();
+                    sig.params.push(AbiParam::new(cl_type));
                 }
-                sig.returns.push(AbiParam::new(types::I64));
+                let cl_ret_type = ret_ty.into();
+                sig.returns.push(AbiParam::new(cl_ret_type));
 
                 // global module holds the function id
                 let callee = module
                     .declare_function(name, Linkage::Import, &sig)
                     .expect("Function not found");
-
                 // get the function into the local builder's context
                 let local_callee = module.declare_func_in_func(callee, &mut builder.func);
 
@@ -451,7 +511,7 @@ impl JITEngine {
                 let call_inst = builder.ins().call(local_callee, &arg_values);
                 Some(builder.inst_results(call_inst)[0])
             }
-            Expr::FnDecl(_, _, _) => {
+            TypedExpr::FnDecl(..) => {
                 // ignore inside compile_expr we process these at the top level
                 Some(builder.ins().iconst(types::I64, 0))
             }
