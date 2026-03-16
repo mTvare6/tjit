@@ -41,7 +41,10 @@ pub enum Token {
     RParen,
     LBrace,
     RBrace,
+    LBracket,
+    RBracket,
     Comma,
+    Semicolon,
     Colon,
     Arrow,
 }
@@ -84,7 +87,7 @@ impl<'a> Lexer<'a> {
     fn read_ident(&mut self) -> String {
         let mut word = String::new();
         while let Some(&ch) = self.chars.peek() {
-            if ch.is_alphanumeric() {
+            if ch.is_alphanumeric() || ch == '_' {
                 word.push(ch);
                 self.chars.next();
             } else {
@@ -111,7 +114,7 @@ impl<'a> Lexer<'a> {
     pub fn next_token(&mut self) -> Token {
         while let Some(&ch) = self.chars.peek() {
             match ch {
-                ' ' | '\t' | '\n' | ';' => {
+                ' ' | '\t' | '\n' => {
                     self.chars.next();
                     continue;
                 }
@@ -143,6 +146,10 @@ impl<'a> Lexer<'a> {
                     self.chars.next();
                     return Token::Colon;
                 }
+                ';' => {
+                    self.chars.next();
+                    return Token::Semicolon;
+                }
                 '.' => {
                     self.chars.next();
                     return Token::Dot;
@@ -172,7 +179,7 @@ impl<'a> Lexer<'a> {
                     return Token::GreaterThan;
                 }
                 '0'..='9' => return self.lex_number(),
-                'a'..='z' | 'A'..='Z' => return self.lex_identifier(),
+                'a'..='z' | 'A'..='Z' | '_' => return self.lex_identifier(),
                 '(' => {
                     self.chars.next();
                     return Token::LParen;
@@ -188,6 +195,14 @@ impl<'a> Lexer<'a> {
                 '}' => {
                     self.chars.next();
                     return Token::RBrace;
+                }
+                ']' => {
+                    self.chars.next();
+                    return Token::RBracket;
+                }
+                '[' => {
+                    self.chars.next();
+                    return Token::LBracket;
                 }
                 _ => panic!("Unexpected character: {}", ch),
             }

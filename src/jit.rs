@@ -9,6 +9,11 @@ use std::mem;
 type LoopStack = Vec<(Block, Block)>;
 type VariableMap = HashMap<String, Variable>;
 
+extern "C" fn print_i64(val: i64) -> i64 {
+    println!(">>> {}", val);
+    0
+}
+
 // for selecting arithmetic instructions
 macro_rules! emit_binary_op {
     ($builder:expr, $ty:expr, $lhs:expr, $rhs:expr, $int_op:ident, $uint_op:ident, $float_op:ident) => {
@@ -16,7 +21,7 @@ macro_rules! emit_binary_op {
             Type::I8 | Type::I16 | Type::I32 | Type::I64 => $builder.ins().$int_op($lhs, $rhs),
             Type::U8 | Type::U16 | Type::U32 | Type::U64 => $builder.ins().$uint_op($lhs, $rhs),
             Type::F32 | Type::F64 => $builder.ins().$float_op($lhs, $rhs),
-            Type::Custom(_) => panic!("Fatal: Cannot perform arithmetic operations on structs"),
+            Type::Custom(_) | Type::Array(..) => panic!("Fatal: Cannot perform arithmetic operations on structs"),
         }
     };
 }
@@ -37,7 +42,7 @@ macro_rules! emit_cmp_op {
                 let b = $builder.ins().fcmp(FloatCC::$float_cc, $lhs, $rhs);
                 $builder.ins().uextend(types::I64, b)
             }
-            Type::Custom(_) => panic!("Fatal: Cannot compare raw struct memory directly"),
+            Type::Custom(_) | Type::Array(..) => panic!("Fatal: Cannot compare raw struct memory directly"),
         }
     };
 }
@@ -61,7 +66,10 @@ impl JITEngine {
             .unwrap();
 
         // get executable memory
-        let builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+        let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+
+        builder.symbol("print", print_i64 as *const u8);
+
         let module = JITModule::new(builder);
 
         Self {
@@ -168,13 +176,11 @@ impl JITEngine {
             }
         }
 
-
         for expr in program {
             if let TypedExpr::FnDecl(name, params, ret_ty, body) = expr {
                 self.compile_function(name, params, ret_ty, body, &structs)?;
             }
         }
-
 
         self.module.clear_context(&mut self.ctx);
         self.ctx
@@ -609,6 +615,77 @@ impl JITEngine {
                 let val = builder
                     .ins()
                     .load(cl_type, MemFlags::new(), base_ptr, *offset);
+
+                Some(val)
+            }
+            TypedExpr::ArrayInit(elements, _array_ty) => {
+                let element_size = 8; // 8 bytes per element
+                let total_size = (elements.len() as u32) * element_size;
+
+                // contiguous block on the call stack
+                let slot_data = StackSlotData::new(StackSlotKind::ExplicitSlot, total_size);
+                let slot = builder.create_sized_stack_slot(slot_data);
+
+                // base memory pointer
+                let base_ptr = builder.ins().stack_addr(types::I64, slot, 0);
+                for (i, elem_expr) in elements.iter().enumerate() {
+                    let val = Self::compile_expr(
+                        elem_expr,
+                        module,
+                        builder,
+                        variables,
+                        variable_index,
+                        loop_stack,
+                        structs,
+                    )?;
+
+                    let offset = (i as i32) * (element_size as i32);
+                    builder.ins().store(MemFlags::new(), val, base_ptr, offset);
+                }
+
+                Some(base_ptr)
+            }
+            TypedExpr::Index(array_expr, index_expr, inner_ty) => {
+                let base_ptr = Self::compile_expr(
+                    array_expr,
+                    module,
+                    builder,
+                    variables,
+                    variable_index,
+                    loop_stack,
+                    structs,
+                )?;
+
+                let mut index_val = Self::compile_expr(
+                    index_expr,
+                    module,
+                    builder,
+                    variables,
+                    variable_index,
+                    loop_stack,
+                    structs,
+                )?;
+
+                // if passed an i8 or i32 as the index, expand to i64
+                match index_expr.ty() {
+                    Type::I8 | Type::I16 | Type::I32 => {
+                        index_val = builder.ins().sextend(types::I64, index_val);
+                    }
+                    Type::U8 | Type::U16 | Type::U32 => {
+                        index_val = builder.ins().uextend(types::I64, index_val);
+                    }
+                    _ => {}
+                }
+
+                // dynamic byte offset: offset = index * 8
+                let offset_val = builder.ins().imul_imm(index_val, 8);
+
+                // add offset to the base pointer: target = base + offset
+                let target_ptr = builder.ins().iadd(base_ptr, offset_val);
+
+                // load from the calculated address
+                let cl_type = inner_ty.into();
+                let val = builder.ins().load(cl_type, MemFlags::new(), target_ptr, 0);
 
                 Some(val)
             }

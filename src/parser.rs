@@ -19,6 +19,8 @@ pub enum Expr {
     StructDecl(String, Vec<(String, Type)>),
     StructInit(String, Vec<(String, Box<Expr>)>),
     FieldAccess(Box<Expr>, String),
+    ArrayInit(Vec<Expr>),
+    Index(Box<Expr>, Box<Expr>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -34,6 +36,7 @@ pub enum Type {
     F32,
     F64,
     Custom(String),
+    Array(Box<Type>, usize),
 }
 
 impl Into<types::Type> for &Type {
@@ -46,6 +49,7 @@ impl Into<types::Type> for &Type {
             Type::F32 => types::F32,
             Type::F64 => types::F64,
             Type::Custom(..) => types::I64,
+            Type::Array(..) => types::I64,
         }
     }
 }
@@ -94,6 +98,24 @@ impl<'a> Parser<'a> {
 
     fn parse_primary(&mut self) -> Option<Expr> {
         let expr = match self.peek()? {
+            Token::LBracket => {
+                self.next();
+                let mut elements = Vec::new();
+                if self.peek() != Some(&Token::RBracket) {
+                    loop {
+                        elements.push(self.parse_expression().expect("Expected array element"));
+                        if self.peek() == Some(&Token::Comma) {
+                            self.next();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                let Some(Token::RBracket) = self.next() else {
+                    panic!("Expected ']'")
+                };
+                Some(Expr::ArrayInit(elements))
+            }
             Token::Number(n) => {
                 let val = *n;
                 self.next();
@@ -167,21 +189,50 @@ impl<'a> Parser<'a> {
         };
 
         let mut expr = expr?;
-        while self.peek() == Some(&Token::Dot) {
-            self.next();
 
-            let field_name = match self.next() {
-                Some(Token::Identifier(name)) => name.clone(),
-                _ => panic!("Expected field name after '.'"),
-            };
-
-            expr = Expr::FieldAccess(Box::new(expr), field_name);
+        // handle chained postfix operations, a.b.c or arr[0][1]
+        loop {
+            if self.peek() == Some(&Token::Dot) {
+                self.next();
+                let field_name = match self.next() {
+                    Some(Token::Identifier(name)) => name.clone(),
+                    _ => panic!("Expected field name after '.'"),
+                };
+                expr = Expr::FieldAccess(Box::new(expr), field_name);
+            } else if self.peek() == Some(&Token::LBracket) {
+                self.next();
+                let index_expr = self.parse_expression().expect("Expected index expression");
+                let Some(Token::RBracket) = self.next() else {
+                    panic!("Expected ']' after index")
+                };
+                expr = Expr::Index(Box::new(expr), Box::new(index_expr));
+            } else {
+                break;
+            }
         }
 
         Some(expr)
     }
 
     fn parse_type(&mut self) -> Type {
+        if self.peek() == Some(&Token::LBracket) {
+            self.next();
+            let inner_ty = self.parse_type();
+
+            let Some(Token::Semicolon) = self.next() else {
+                panic!("Expected ';' in array type (e.g. [i32; 5])")
+            };
+
+            let size = match self.next() {
+                Some(Token::Number(n)) => *n as usize,
+                _ => panic!("Expected array length"),
+            };
+
+            let Some(Token::RBracket) = self.next() else {
+                panic!("Expected ']'")
+            };
+            return Type::Array(Box::new(inner_ty), size);
+        }
         if let Some(Token::Identifier(type_name)) = self.peek() {
             let ty = match type_name.as_str() {
                 "i8" => Type::I8,

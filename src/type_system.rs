@@ -20,6 +20,8 @@ pub enum TypedExpr {
     StructDecl(String, Vec<(String, Type)>),
     StructInit(String, Vec<(String, Box<TypedExpr>)>),
     FieldAccess(Box<TypedExpr>, String, Type),
+    ArrayInit(Vec<TypedExpr>, Type),
+    Index(Box<TypedExpr>, Box<TypedExpr>, Type),
 }
 
 impl TypedExpr {
@@ -33,6 +35,9 @@ impl TypedExpr {
             | TypedExpr::Loop(_, t)
             | TypedExpr::Number(_, t)
             | TypedExpr::Block(_, t)
+            | TypedExpr::FieldAccess(_, _, t)
+            | TypedExpr::ArrayInit(_, t)
+            | TypedExpr::Index(_, _, t)
             | TypedExpr::Call(_, _, t) => t.clone(),
             TypedExpr::Break(e) => e.ty(),
             TypedExpr::Float(_) => Type::F64,
@@ -40,7 +45,6 @@ impl TypedExpr {
             TypedExpr::FnDecl(..) => Type::I64,
             TypedExpr::StructDecl(..) => Type::I64,
             TypedExpr::StructInit(name, _) => Type::Custom(name.clone()),
-            TypedExpr::FieldAccess(_, _, t) => t.clone(),
         }
     }
 }
@@ -76,9 +80,11 @@ pub struct TypeChecker {
 
 impl TypeChecker {
     pub fn new() -> Self {
+        let mut functions = HashMap::new();
+        functions.insert(String::from("print"), (vec![Type::I64], Type::I64));
         Self {
             variables: HashMap::new(),
-            functions: HashMap::new(),
+            functions,
             structs: HashMap::new(),
             loop_break_type: None,
         }
@@ -95,7 +101,7 @@ impl TypeChecker {
                 }
                 Expr::StructDecl(name, fields) => {
                     let mut layout = HashMap::new();
-                    let mut offset:i32 = 0;
+                    let mut offset: i32 = 0;
                     for (f_name, f_ty) in fields {
                         layout.insert(f_name.clone(), (f_ty.clone(), offset));
                         offset += 8;
@@ -417,6 +423,78 @@ impl TypeChecker {
                     Box::new(t_base),
                     field_name.clone(),
                     f_ty.clone(),
+                ))
+            }
+            Expr::ArrayInit(elements) => {
+                if elements.is_empty() {
+                    return Err(
+                        "Type Error: Cannot infer type of empty array without explicit annotation"
+                            .into(),
+                    );
+                }
+
+                let mut t_elements = Vec::new();
+
+                // establish the baseline type
+                let first_elem = self.check_expr(&elements[0])?;
+                let element_ty = first_elem.ty();
+                t_elements.push(first_elem);
+
+                // all subsequent elements shoudl be baseline type
+                for e in elements.iter().skip(1) {
+                    let mut t_e = self.check_expr(e)?;
+
+                    // literal type coercion
+                    if let TypedExpr::Number(n, _) = &mut t_e {
+                        if element_ty.is_integer_type() {
+                            t_e = TypedExpr::Number(*n, element_ty.clone());
+                        }
+                    }
+
+                    if t_e.ty() != element_ty {
+                        return Err(format!(
+                            "Type Error: Array elements must be homogenous. Expected {:?}, got {:?}",
+                            element_ty,
+                            t_e.ty()
+                        ));
+                    }
+                    t_elements.push(t_e);
+                }
+
+                let array_ty = Type::Array(Box::new(element_ty), elements.len());
+                Ok(TypedExpr::ArrayInit(t_elements, array_ty))
+            }
+
+            Expr::Index(array_expr, index_expr) => {
+                let t_array = self.check_expr(array_expr)?;
+                let mut t_index = self.check_expr(index_expr)?;
+
+                if let TypedExpr::Number(n, _) = &mut t_index {
+                    t_index = TypedExpr::Number(*n, Type::I64);
+                }
+
+                if !t_index.ty().is_integer_type() {
+                    return Err(format!(
+                        "Type Error: Array index must be an integer, got {:?}",
+                        t_index.ty()
+                    ));
+                }
+
+                // base expression should be an array, get its inner type
+                let inner_ty = match t_array.ty() {
+                    Type::Array(inner, _) => *inner,
+                    _ => {
+                        return Err(format!(
+                            "Type Error: Cannot index into non-array type {:?}",
+                            t_array.ty()
+                        ));
+                    }
+                };
+
+                Ok(TypedExpr::Index(
+                    Box::new(t_array),
+                    Box::new(t_index),
+                    inner_ty,
                 ))
             }
         }
