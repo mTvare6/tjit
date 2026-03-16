@@ -1,6 +1,37 @@
 use crate::parser::{Expr, Op, Type};
 use std::collections::HashMap;
 
+pub fn align_to(offset: u32, align: u32) -> u32 {
+    (offset + align - 1) & !(align - 1)
+}
+
+pub fn size_and_align_of(
+    ty: &Type,
+    structs: &HashMap<String, StructLayout>,
+    enums: &HashMap<String, EnumLayout>,
+) -> (u32, u32) {
+    match ty {
+        Type::I8 | Type::U8 => (1, 1),
+        Type::I16 | Type::U16 => (2, 2),
+        Type::I32 | Type::U32 | Type::F32 => (4, 4),
+        Type::I64 | Type::U64 | Type::F64 => (8, 8),
+        Type::Array(inner, len) => {
+            let (elem_size, align) = size_and_align_of(inner, structs, enums);
+            let stride = align_to(elem_size, align);
+            (stride * (*len as u32), align)
+        }
+        Type::Custom(name) | Type::Enum(name) => {
+            if let Some(l) = structs.get(name) {
+                (l.size, l.align)
+            } else if let Some(l) = enums.get(name) {
+                (l.size, l.align)
+            } else {
+                panic!("Fatal: Type '{}' not resolved during layout phase", name);
+            }
+        }
+    }
+}
+
 // typed intermediate representation (=MIR)
 #[derive(Debug, Clone)]
 pub enum TypedExpr {
@@ -22,11 +53,11 @@ pub enum TypedExpr {
     FieldAccess(Box<TypedExpr>, String, Type),
     ArrayInit(Vec<TypedExpr>, Type),
     Index(Box<TypedExpr>, Box<TypedExpr>, Type),
-    EnumDecl(String, Vec<(String, Option<Type>)>),
-    EnumInit(String, String, Option<Box<TypedExpr>>),
+    EnumDecl(String, Vec<(String, Vec<Type>)>),
+    EnumInit(String, String, Vec<TypedExpr>),
     Match(
         Box<TypedExpr>,
-        Vec<(String, String, Option<String>, Box<TypedExpr>)>,
+        Vec<(String, String, Vec<String>, Box<TypedExpr>)>,
         Type,
     ),
 }
@@ -78,21 +109,25 @@ impl Type {
 #[derive(Clone)]
 pub struct StructLayout {
     pub size: u32,
+    pub align: u32,
     pub fields: HashMap<String, (Type, i32)>, // maps field name to its (type, byte_offset)
 }
 
 #[derive(Clone)]
 pub struct EnumLayout {
     pub size: u32,
-    pub variants: HashMap<String, (u32, Option<Type>)>, // maps VariantName -> (Integer Tag, Payload Type)
+    pub align: u32,
+    pub variants: HashMap<String, (u32, Vec<(Type, i32)>)>, // maps variant name to (integer tag, payload types + offsets)
 }
 
 pub struct TypeChecker {
     variables: HashMap<String, Type>,
     functions: HashMap<String, (Vec<Type>, Type)>,
-    structs: HashMap<String, StructLayout>,
-    enums: HashMap<String, EnumLayout>,
+    pub structs: HashMap<String, StructLayout>,
+    pub enums: HashMap<String, EnumLayout>,
     loop_break_type: Option<Type>,
+    pending_structs: HashMap<String, Vec<(String, Type)>>,
+    pending_enums: HashMap<String, Vec<(String, Vec<Type>)>>,
 }
 
 impl TypeChecker {
@@ -105,11 +140,12 @@ impl TypeChecker {
             structs: HashMap::new(),
             enums: HashMap::new(),
             loop_break_type: None,
+            pending_structs: HashMap::new(),
+            pending_enums: HashMap::new(),
         }
     }
 
     pub fn check_program(&mut self, program: &[Expr]) -> Result<Vec<TypedExpr>, String> {
-        // global signatures and memory layouts
         for expr in program {
             match expr {
                 Expr::FnDecl(name, params, ret_type, _) => {
@@ -118,45 +154,117 @@ impl TypeChecker {
                         .insert(name.clone(), (param_types, ret_type.clone()));
                 }
                 Expr::StructDecl(name, fields) => {
-                    let mut layout = HashMap::new();
-                    let mut offset: i32 = 0;
-                    for (f_name, f_ty) in fields {
-                        layout.insert(f_name.clone(), (f_ty.clone(), offset));
-                        offset += 8;
-                    }
-                    self.structs.insert(
-                        name.clone(),
-                        StructLayout {
-                            size: offset as u32,
-                            fields: layout,
-                        },
-                    );
+                    self.pending_structs.insert(name.clone(), fields.clone());
                 }
                 Expr::EnumDecl(name, variants) => {
-                    let mut layout = HashMap::new();
-                    let mut tag_counter = 0;
-                    for (v_name, v_ty) in variants {
-                        layout.insert(v_name.clone(), (tag_counter, v_ty.clone()));
-                        tag_counter += 1;
-                    }
-                    self.enums.insert(
-                        name.clone(),
-                        EnumLayout {
-                            size: 16,
-                            variants: layout,
-                        },
-                    );
+                    self.pending_enums.insert(name.clone(), variants.clone());
                 }
                 _ => {}
             }
         }
 
+        // recursively resolve layouts
+        let struct_names: Vec<String> = self.pending_structs.keys().cloned().collect();
+        for name in struct_names {
+            self.resolve_layout(&name);
+        }
+
+        let enum_names: Vec<String> = self.pending_enums.keys().cloned().collect();
+        for name in enum_names {
+            self.resolve_layout(&name);
+        }
+
+        // typecheck expressions
         let mut typed_program = Vec::new();
         for expr in program {
             typed_program.push(self.check_expr(expr)?);
         }
 
         Ok(typed_program)
+    }
+
+    // topological resolver
+    fn resolve_layout(&mut self, name: &str) {
+        if self.structs.contains_key(name) || self.enums.contains_key(name) {
+            return;
+        }
+
+        if let Some(fields) = self.pending_structs.clone().get(name) {
+            let mut layout = HashMap::new();
+            let mut offset = 0;
+            let mut max_align = 1;
+
+            for (f_name, f_ty) in fields {
+                if let Type::Custom(c_name) = f_ty {
+                    self.resolve_layout(c_name);
+                } // Recursion!
+
+                let (f_size, f_align) = size_and_align_of(f_ty, &self.structs, &self.enums);
+                offset = align_to(offset, f_align);
+                layout.insert(f_name.clone(), (f_ty.clone(), offset as i32));
+                offset += f_size;
+                if f_align > max_align {
+                    max_align = f_align;
+                }
+            }
+
+            let size = align_to(offset, max_align);
+            self.structs.insert(
+                name.to_string(),
+                StructLayout {
+                    size,
+                    align: max_align,
+                    fields: layout,
+                },
+            );
+        } else if let Some(variants) = self.pending_enums.clone().get(name) {
+            let mut layout = HashMap::new();
+            let mut max_size = 4; // at minimum, 4 bytes for the i32 tag
+            let mut max_align = 4;
+            let mut tag_counter = 0;
+
+            for (v_name, v_tys) in variants {
+                let mut payload_offset = 4; // tag lives at byte 0
+                let mut variant_align = 4;
+                let mut field_layouts = Vec::new();
+
+                for f_ty in v_tys {
+                    if let Type::Custom(c_name) = f_ty {
+                        self.resolve_layout(c_name);
+                    } // recursion
+
+                    let (f_size, f_align) = size_and_align_of(f_ty, &self.structs, &self.enums);
+                    payload_offset = align_to(payload_offset, f_align);
+                    field_layouts.push((f_ty.clone(), payload_offset as i32));
+                    payload_offset += f_size;
+                    if f_align > variant_align {
+                        variant_align = f_align;
+                    }
+                }
+
+                if payload_offset > max_size {
+                    max_size = payload_offset;
+                }
+                if variant_align > max_align {
+                    max_align = variant_align;
+                }
+
+                layout.insert(v_name.clone(), (tag_counter, field_layouts));
+                tag_counter += 1;
+            }
+
+            let size = align_to(max_size, max_align);
+            self.enums.insert(
+                name.to_string(),
+                EnumLayout {
+                    size,
+                    align: max_align,
+                    variants: layout,
+                },
+            );
+        } else {
+            panic!("Type Error: Undefined custom type '{}'", name);
+        }
     }
 
     fn check_expr(&mut self, expr: &Expr) -> Result<TypedExpr, String> {
@@ -533,62 +641,59 @@ impl TypeChecker {
             Expr::EnumDecl(name, variants) => {
                 Ok(TypedExpr::EnumDecl(name.clone(), variants.clone()))
             }
-            Expr::EnumInit(enum_name, variant_name, payload) => {
-                let expected_payload_ty = {
+            Expr::EnumInit(enum_name, variant_name, payloads) => {
+                let expected_payload_tys = {
                     let layout = self
                         .enums
                         .get(enum_name)
                         .ok_or_else(|| format!("Type Error: Unknown enum '{}'", enum_name))?;
-
-                    let (_, expected_ty) = layout.variants.get(variant_name).ok_or_else(|| {
+                    let (_, expected_tys) = layout.variants.get(variant_name).ok_or_else(|| {
                         format!(
                             "Type Error: Enum '{}' has no variant '{}'",
                             enum_name, variant_name
                         )
                     })?;
-
-                    expected_ty.clone()
+                    expected_tys.clone()
                 };
 
-                let mut t_payload = None;
-                if let Some(p) = payload {
+                if payloads.len() != expected_payload_tys.len() {
+                    return Err(format!(
+                        "Type Error: Variant '{}::{}' expects {} payloads, got {}",
+                        enum_name,
+                        variant_name,
+                        expected_payload_tys.len(),
+                        payloads.len()
+                    ));
+                }
+
+                let mut t_payloads = Vec::new();
+                for (p, (expected_ty, _offset)) in payloads.iter().zip(expected_payload_tys.iter())
+                {
                     let mut eval_p = self.check_expr(p)?;
 
-                    if let Some(expected_ty) = &expected_payload_ty {
-                        // literal coercion
-                        if let TypedExpr::Number(n, _) = &mut eval_p {
-                            if expected_ty.is_integer_type() {
-                                eval_p = TypedExpr::Number(*n, expected_ty.clone());
-                            }
+                    // literal coercion
+                    if let TypedExpr::Number(n, _) = &mut eval_p {
+                        if expected_ty.is_integer_type() {
+                            eval_p = TypedExpr::Number(*n, expected_ty.clone());
                         }
+                    }
 
-                        if eval_p.ty() != *expected_ty {
-                            return Err(format!(
-                                "Type Error: Variant '{}::{}' expects payload of type {:?}, got {:?}",
-                                enum_name,
-                                variant_name,
-                                expected_ty,
-                                eval_p.ty()
-                            ));
-                        }
-                    } else {
+                    if eval_p.ty() != *expected_ty {
                         return Err(format!(
-                            "Type Error: Variant '{}::{}' does not take a payload",
-                            enum_name, variant_name
+                            "Type Error: Variant '{}::{}' expects payload of type {:?}, got {:?}",
+                            enum_name,
+                            variant_name,
+                            expected_ty,
+                            eval_p.ty()
                         ));
                     }
-                    t_payload = Some(Box::new(eval_p));
-                } else if expected_payload_ty.is_some() {
-                    return Err(format!(
-                        "Type Error: Variant '{}::{}' expects a payload",
-                        enum_name, variant_name
-                    ));
+                    t_payloads.push(eval_p);
                 }
 
                 Ok(TypedExpr::EnumInit(
                     enum_name.clone(),
                     variant_name.clone(),
-                    t_payload,
+                    t_payloads,
                 ))
             }
             Expr::Match(target, arms) => {
@@ -605,7 +710,7 @@ impl TypeChecker {
                 let mut t_arms = Vec::new();
                 let mut return_ty = None;
 
-                for (arm_enum_name, variant_name, bind_name, body) in arms {
+                for (arm_enum_name, variant_name, bind_names, body) in arms {
                     if *arm_enum_name != enum_name {
                         return Err(format!(
                             "Type Error: Match arm enum mismatch. Expected '{}', got '{}'",
@@ -613,24 +718,24 @@ impl TypeChecker {
                         ));
                     }
 
-                    let (_, expected_payload_ty) =
-                        layout.variants.get(variant_name).ok_or_else(|| {
-                            format!("Type Error: Variant '{}' does not exist", variant_name)
-                        })?;
+                    let (_, expected_payload_tys) = layout.variants.get(variant_name).unwrap();
 
-                    // get the bound variable into the scope for the body evaluation
+                    if bind_names.len() != expected_payload_tys.len() {
+                        return Err(format!(
+                            "Type Error: Variant '{}' binds {} variables, but has {} payloads",
+                            variant_name,
+                            bind_names.len(),
+                            expected_payload_tys.len()
+                        ));
+                    }
+
                     let previous_vars = std::mem::take(&mut self.variables);
-                    self.variables = previous_vars.clone(); // shallow scope copy
+                    self.variables = previous_vars.clone();
 
-                    if let Some(b_name) = bind_name {
-                        if let Some(p_ty) = expected_payload_ty {
-                            self.variables.insert(b_name.clone(), p_ty.clone());
-                        } else {
-                            return Err(format!(
-                                "Type Error: Cannot bind variable. Variant '{}' has no payload.",
-                                variant_name
-                            ));
-                        }
+                    for (b_name, (p_ty, _offset)) in
+                        bind_names.iter().zip(expected_payload_tys.iter())
+                    {
+                        self.variables.insert(b_name.clone(), p_ty.clone());
                     }
 
                     let t_body = self.check_expr(body)?;
@@ -651,7 +756,7 @@ impl TypeChecker {
                     t_arms.push((
                         arm_enum_name.clone(),
                         variant_name.clone(),
-                        bind_name.clone(),
+                        bind_names.clone(),
                         Box::new(t_body),
                     ));
                     self.variables = previous_vars;

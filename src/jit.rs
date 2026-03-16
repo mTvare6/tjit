@@ -1,5 +1,5 @@
 use crate::parser::{Op, Type};
-use crate::type_system::{EnumLayout, StructLayout, TypedExpr};
+use crate::type_system::{EnumLayout, StructLayout, TypedExpr, align_to, size_and_align_of};
 use cranelift::prelude::*;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
@@ -161,49 +161,16 @@ impl JITEngine {
         Ok(())
     }
 
-    pub fn compile(&mut self, program: &[TypedExpr]) -> Result<fn() -> i64, String> {
+    pub fn compile(
+        &mut self,
+        program: &[TypedExpr],
+        structs: &HashMap<String, StructLayout>,
+        enums: &HashMap<String, EnumLayout>,
+    ) -> Result<fn() -> i64, String> {
         // global function compilation
-        let mut structs = HashMap::new();
-        for expr in program {
-            if let TypedExpr::StructDecl(name, fields) = expr {
-                let mut layout = HashMap::new();
-                let mut offset = 0;
-                for (f_name, f_ty) in fields {
-                    layout.insert(f_name.clone(), (f_ty.clone(), offset));
-                    offset += 8; // Force 8-byte alignment for all fields
-                }
-                structs.insert(
-                    name.clone(),
-                    StructLayout {
-                        size: offset as u32,
-                        fields: layout,
-                    },
-                );
-            }
-        }
-
-        let mut enums = HashMap::new();
-        for expr in program {
-            if let TypedExpr::EnumDecl(name, variants) = expr {
-                let mut layout = HashMap::new();
-                let mut tag_counter = 0;
-                for (v_name, v_ty) in variants {
-                    layout.insert(v_name.clone(), (tag_counter, v_ty.clone()));
-                    tag_counter += 1;
-                }
-                enums.insert(
-                    name.clone(),
-                    EnumLayout {
-                        size: 16,
-                        variants: layout,
-                    },
-                );
-            }
-        }
-
         for expr in program {
             if let TypedExpr::FnDecl(name, params, ret_ty, body) = expr {
-                self.compile_function(name, params, ret_ty, body, &structs, &enums)?;
+                self.compile_function(name, params, ret_ty, body, structs, enums)?;
             }
         }
 
@@ -659,15 +626,15 @@ impl JITEngine {
                 Some(val)
             }
             TypedExpr::ArrayInit(elements, _array_ty) => {
-                let element_size = 8; // 8 bytes per element
-                let total_size = (elements.len() as u32) * element_size;
+                let inner_ty = elements[0].ty();
+                let (elem_size, align) = size_and_align_of(&inner_ty, structs, enums);
+                let stride = align_to(elem_size, align);
+                let total_size = stride * (elements.len() as u32);
 
-                // contiguous block on the call stack
                 let slot_data = StackSlotData::new(StackSlotKind::ExplicitSlot, total_size);
                 let slot = builder.create_sized_stack_slot(slot_data);
-
-                // base memory pointer
                 let base_ptr = builder.ins().stack_addr(types::I64, slot, 0);
+
                 for (i, elem_expr) in elements.iter().enumerate() {
                     let val = Self::compile_expr(
                         elem_expr,
@@ -679,11 +646,9 @@ impl JITEngine {
                         structs,
                         enums,
                     )?;
-
-                    let offset = (i as i32) * (element_size as i32);
+                    let offset = (i as i32) * (stride as i32);
                     builder.ins().store(MemFlags::new(), val, base_ptr, offset);
                 }
-
                 Some(base_ptr)
             }
             TypedExpr::Index(array_expr, index_expr, inner_ty) => {
@@ -720,33 +685,29 @@ impl JITEngine {
                     _ => {}
                 }
 
-                // dynamic byte offset: offset = index * 8
-                let offset_val = builder.ins().imul_imm(index_val, 8);
+                let (elem_size, align) = size_and_align_of(inner_ty, structs, enums);
+                let stride = align_to(elem_size, align);
 
-                // add offset to the base pointer: target = base + offset
+                let offset_val = builder.ins().imul_imm(index_val, stride as i64);
                 let target_ptr = builder.ins().iadd(base_ptr, offset_val);
 
-                // load from the calculated address
                 let cl_type = inner_ty.into();
                 let val = builder.ins().load(cl_type, MemFlags::new(), target_ptr, 0);
-
                 Some(val)
             }
             TypedExpr::EnumDecl(..) => Some(builder.ins().iconst(types::I64, 0)),
-            TypedExpr::EnumInit(enum_name, variant_name, payload) => {
+            TypedExpr::EnumInit(enum_name, variant_name, payloads) => {
                 let layout = enums.get(enum_name).unwrap();
-                let (tag, _) = layout.variants.get(variant_name).unwrap();
+                let (tag, field_layouts) = layout.variants.get(variant_name).unwrap();
 
                 let slot_data = StackSlotData::new(StackSlotKind::ExplicitSlot, layout.size);
                 let slot = builder.create_sized_stack_slot(slot_data);
                 let base_ptr = builder.ins().stack_addr(types::I64, slot, 0);
 
-                // tag (as a 32-bit integer) at byte offset 0
                 let tag_val = builder.ins().iconst(types::I32, *tag as i64);
                 builder.ins().store(MemFlags::new(), tag_val, base_ptr, 0);
 
-                // payload at byte offset 8 (if it exists)
-                if let Some(p) = payload {
+                for (i, p) in payloads.iter().enumerate() {
                     let p_val = Self::compile_expr(
                         p,
                         module,
@@ -757,9 +718,12 @@ impl JITEngine {
                         structs,
                         enums,
                     )?;
-                    builder.ins().store(MemFlags::new(), p_val, base_ptr, 8);
-                }
 
+                    let (_, offset) = field_layouts[i];
+                    builder
+                        .ins()
+                        .store(MemFlags::new(), p_val, base_ptr, offset);
+                }
                 Some(base_ptr)
             }
             TypedExpr::Match(target, arms, ret_ty) => {
@@ -787,9 +751,9 @@ impl JITEngine {
                 builder.ins().jump(next_block, &[]);
 
                 // build the cascading decision tree
-                for (arm_enum, variant_name, bind_name, body) in arms {
+                for (arm_enum, variant_name, bind_names, body) in arms {
                     let layout = enums.get(arm_enum).unwrap();
-                    let (expected_tag, expected_payload_ty) =
+                    let (expected_tag, expected_payload_tys) =
                         layout.variants.get(variant_name).unwrap();
 
                     builder.switch_to_block(next_block);
@@ -812,13 +776,14 @@ impl JITEngine {
                     builder.seal_block(arm_block);
 
                     // If written `Some(val) =>`, bind `val` to the payload in RAM
-                    if let Some(b_name) = bind_name {
-                        let p_ty = expected_payload_ty.as_ref().unwrap();
+                    let p_tys = expected_payload_tys;
+                    for (i, b_name) in bind_names.iter().enumerate() {
+                        let (p_ty, offset) = &expected_payload_tys[i];
 
-                        // Load payload from offset 8
-                        let p_val = builder
-                            .ins()
-                            .load(p_ty.into(), MemFlags::new(), base_ptr, 8);
+                        let p_val =
+                            builder
+                                .ins()
+                                .load(p_ty.into(), MemFlags::new(), base_ptr, *offset);
 
                         let var = Variable::new(*variable_index);
                         *variable_index += 1;
