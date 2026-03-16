@@ -1,5 +1,5 @@
 use crate::parser::{Op, Type};
-use crate::type_system::{StructLayout, TypedExpr};
+use crate::type_system::{EnumLayout, StructLayout, TypedExpr};
 use cranelift::prelude::*;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
@@ -10,7 +10,7 @@ type LoopStack = Vec<(Block, Block)>;
 type VariableMap = HashMap<String, Variable>;
 
 extern "C" fn print_i64(val: i64) -> i64 {
-    println!(">>> {}", val);
+    println!("=> {}", val);
     0
 }
 
@@ -21,7 +21,9 @@ macro_rules! emit_binary_op {
             Type::I8 | Type::I16 | Type::I32 | Type::I64 => $builder.ins().$int_op($lhs, $rhs),
             Type::U8 | Type::U16 | Type::U32 | Type::U64 => $builder.ins().$uint_op($lhs, $rhs),
             Type::F32 | Type::F64 => $builder.ins().$float_op($lhs, $rhs),
-            Type::Custom(_) | Type::Array(..) => panic!("Fatal: Cannot perform arithmetic operations on structs"),
+            Type::Custom(_) | Type::Array(..) | Type::Enum(..) => {
+                panic!("Fatal: Cannot perform arithmetic operations on non numeric type")
+            }
         }
     };
 }
@@ -42,7 +44,9 @@ macro_rules! emit_cmp_op {
                 let b = $builder.ins().fcmp(FloatCC::$float_cc, $lhs, $rhs);
                 $builder.ins().uextend(types::I64, b)
             }
-            Type::Custom(_) | Type::Array(..) => panic!("Fatal: Cannot compare raw struct memory directly"),
+            Type::Custom(_) | Type::Array(..) | Type::Enum(..) => {
+                panic!("Fatal: Cannot compare raw struct memory directly")
+            }
         }
     };
 }
@@ -86,6 +90,7 @@ impl JITEngine {
         ret_ty: &Type,
         body: &TypedExpr,
         structs: &HashMap<String, StructLayout>,
+        enums: &HashMap<String, EnumLayout>,
     ) -> Result<(), String> {
         self.module.clear_context(&mut self.ctx);
 
@@ -131,6 +136,7 @@ impl JITEngine {
             &mut variable_index,
             &mut loop_stack,
             &structs,
+            &enums,
         )
         .unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
 
@@ -176,9 +182,28 @@ impl JITEngine {
             }
         }
 
+        let mut enums = HashMap::new();
+        for expr in program {
+            if let TypedExpr::EnumDecl(name, variants) = expr {
+                let mut layout = HashMap::new();
+                let mut tag_counter = 0;
+                for (v_name, v_ty) in variants {
+                    layout.insert(v_name.clone(), (tag_counter, v_ty.clone()));
+                    tag_counter += 1;
+                }
+                enums.insert(
+                    name.clone(),
+                    EnumLayout {
+                        size: 16,
+                        variants: layout,
+                    },
+                );
+            }
+        }
+
         for expr in program {
             if let TypedExpr::FnDecl(name, params, ret_ty, body) = expr {
-                self.compile_function(name, params, ret_ty, body, &structs)?;
+                self.compile_function(name, params, ret_ty, body, &structs, &enums)?;
             }
         }
 
@@ -218,6 +243,7 @@ impl JITEngine {
                 &mut variable_index,
                 &mut loop_stack,
                 &structs,
+                &enums,
             ) {
                 return_val = val;
                 final_type = expr.ty(); // track the type of the last evaluation
@@ -276,6 +302,7 @@ impl JITEngine {
         variable_index: &mut usize,
         loop_stack: &mut LoopStack,
         structs: &HashMap<String, StructLayout>,
+        enums: &HashMap<String, EnumLayout>,
     ) -> Option<Value> {
         match expr {
             TypedExpr::Number(n, num_ty) => {
@@ -292,6 +319,7 @@ impl JITEngine {
                     variable_index,
                     loop_stack,
                     structs,
+                    enums,
                 )?;
                 let rhs = Self::compile_expr(
                     right,
@@ -301,6 +329,7 @@ impl JITEngine {
                     variable_index,
                     loop_stack,
                     structs,
+                    enums,
                 )?;
 
                 Some(match op {
@@ -363,6 +392,7 @@ impl JITEngine {
                     variable_index,
                     loop_stack,
                     structs,
+                    enums,
                 )?;
                 let var = Variable::new(*variable_index);
                 *variable_index += 1;
@@ -382,6 +412,7 @@ impl JITEngine {
                     variable_index,
                     loop_stack,
                     structs,
+                    enums,
                 )?;
                 variables
                     .get(name)
@@ -398,6 +429,7 @@ impl JITEngine {
                     variable_index,
                     loop_stack,
                     structs,
+                    enums,
                 )?;
 
                 let then_block = builder.create_block();
@@ -421,6 +453,7 @@ impl JITEngine {
                     variable_index,
                     loop_stack,
                     structs,
+                    enums,
                 );
                 if let Some(val) = then_val {
                     builder.ins().jump(merge_block, &[val]);
@@ -436,6 +469,7 @@ impl JITEngine {
                     variable_index,
                     loop_stack,
                     structs,
+                    enums,
                 );
                 if let Some(val) = else_val {
                     builder.ins().jump(merge_block, &[val]);
@@ -470,6 +504,7 @@ impl JITEngine {
                     variable_index,
                     loop_stack,
                     structs,
+                    enums,
                 );
                 if inner_val.is_some() {
                     builder.ins().jump(header_block, &[]);
@@ -492,6 +527,7 @@ impl JITEngine {
                     variable_index,
                     loop_stack,
                     structs,
+                    enums,
                 )?;
                 // dummy value to satisfy the type system
                 builder.ins().jump(loop_end, &[val]);
@@ -513,6 +549,7 @@ impl JITEngine {
                         variable_index,
                         loop_stack,
                         structs,
+                        enums,
                     );
                     // if an expression diverged, don't compile the rest of the block (illegal)
                     if last_val.is_none() {
@@ -548,6 +585,7 @@ impl JITEngine {
                         variable_index,
                         loop_stack,
                         structs,
+                        enums,
                     )?);
                 }
 
@@ -583,6 +621,7 @@ impl JITEngine {
                         variable_index,
                         loop_stack,
                         structs,
+                        enums,
                     )?;
                     let (_, offset) = layout.fields.get(f_name).unwrap();
 
@@ -601,6 +640,7 @@ impl JITEngine {
                     variable_index,
                     loop_stack,
                     structs,
+                    enums,
                 )?;
 
                 let Type::Custom(struct_name) = base.ty() else {
@@ -637,6 +677,7 @@ impl JITEngine {
                         variable_index,
                         loop_stack,
                         structs,
+                        enums,
                     )?;
 
                     let offset = (i as i32) * (element_size as i32);
@@ -654,6 +695,7 @@ impl JITEngine {
                     variable_index,
                     loop_stack,
                     structs,
+                    enums,
                 )?;
 
                 let mut index_val = Self::compile_expr(
@@ -664,6 +706,7 @@ impl JITEngine {
                     variable_index,
                     loop_stack,
                     structs,
+                    enums,
                 )?;
 
                 // if passed an i8 or i32 as the index, expand to i64
@@ -688,6 +731,126 @@ impl JITEngine {
                 let val = builder.ins().load(cl_type, MemFlags::new(), target_ptr, 0);
 
                 Some(val)
+            }
+            TypedExpr::EnumDecl(..) => Some(builder.ins().iconst(types::I64, 0)),
+            TypedExpr::EnumInit(enum_name, variant_name, payload) => {
+                let layout = enums.get(enum_name).unwrap();
+                let (tag, _) = layout.variants.get(variant_name).unwrap();
+
+                let slot_data = StackSlotData::new(StackSlotKind::ExplicitSlot, layout.size);
+                let slot = builder.create_sized_stack_slot(slot_data);
+                let base_ptr = builder.ins().stack_addr(types::I64, slot, 0);
+
+                // tag (as a 32-bit integer) at byte offset 0
+                let tag_val = builder.ins().iconst(types::I32, *tag as i64);
+                builder.ins().store(MemFlags::new(), tag_val, base_ptr, 0);
+
+                // payload at byte offset 8 (if it exists)
+                if let Some(p) = payload {
+                    let p_val = Self::compile_expr(
+                        p,
+                        module,
+                        builder,
+                        variables,
+                        variable_index,
+                        loop_stack,
+                        structs,
+                        enums,
+                    )?;
+                    builder.ins().store(MemFlags::new(), p_val, base_ptr, 8);
+                }
+
+                Some(base_ptr)
+            }
+            TypedExpr::Match(target, arms, ret_ty) => {
+                // evaluate the target to get the base pointer
+                let base_ptr = Self::compile_expr(
+                    target,
+                    module,
+                    builder,
+                    variables,
+                    variable_index,
+                    loop_stack,
+                    structs,
+                    enums,
+                )?;
+
+                // load the tag from byte offset 0
+                let tag_val = builder.ins().load(types::I32, MemFlags::new(), base_ptr, 0);
+
+                // setup the exit block for when a match arm finishes
+                let merge_block = builder.create_block();
+                builder.append_block_param(merge_block, ret_ty.into());
+
+                let mut next_block = builder.create_block();
+
+                builder.ins().jump(next_block, &[]);
+
+                // build the cascading decision tree
+                for (arm_enum, variant_name, bind_name, body) in arms {
+                    let layout = enums.get(arm_enum).unwrap();
+                    let (expected_tag, expected_payload_ty) =
+                        layout.variants.get(variant_name).unwrap();
+
+                    builder.switch_to_block(next_block);
+                    builder.seal_block(next_block);
+
+                    // check if RAM tag == expected tag
+                    let expected_tag_val = builder.ins().iconst(types::I32, *expected_tag as i64);
+                    let is_match = builder.ins().icmp(IntCC::Equal, tag_val, expected_tag_val);
+
+                    let arm_block = builder.create_block();
+                    next_block = builder.create_block(); // prepare the block for the next arm to check
+
+                    // branch execution
+                    builder
+                        .ins()
+                        .brif(is_match, arm_block, &[], next_block, &[]);
+
+                    // inside the successful match arm
+                    builder.switch_to_block(arm_block);
+                    builder.seal_block(arm_block);
+
+                    // If written `Some(val) =>`, bind `val` to the payload in RAM
+                    if let Some(b_name) = bind_name {
+                        let p_ty = expected_payload_ty.as_ref().unwrap();
+
+                        // Load payload from offset 8
+                        let p_val = builder
+                            .ins()
+                            .load(p_ty.into(), MemFlags::new(), base_ptr, 8);
+
+                        let var = Variable::new(*variable_index);
+                        *variable_index += 1;
+                        builder.declare_var(var, p_ty.into());
+                        builder.def_var(var, p_val);
+                        variables.insert(b_name.clone(), var);
+                    }
+
+                    let body_val = Self::compile_expr(
+                        body,
+                        module,
+                        builder,
+                        variables,
+                        variable_index,
+                        loop_stack,
+                        structs,
+                        enums,
+                    );
+                    if let Some(v) = body_val {
+                        builder.ins().jump(merge_block, &[v]);
+                    }
+                }
+
+                // fallback if no arms match (rust ensures exhaustiveness at compile time, but trap in the JIT to be safe)
+                builder.switch_to_block(next_block);
+                builder.seal_block(next_block);
+                builder.ins().trap(TrapCode::UnreachableCodeReached);
+
+                builder.switch_to_block(merge_block);
+                builder.seal_block(merge_block);
+
+                Some(builder.block_params(merge_block)[0])
             }
         }
     }

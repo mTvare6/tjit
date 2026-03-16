@@ -21,6 +21,9 @@ pub enum Expr {
     FieldAccess(Box<Expr>, String),
     ArrayInit(Vec<Expr>),
     Index(Box<Expr>, Box<Expr>),
+    EnumDecl(String, Vec<(String, Option<Type>)>),
+    EnumInit(String, String, Option<Box<Expr>>),
+    Match(Box<Expr>, Vec<(String, String, Option<String>, Box<Expr>)>), // (TargetExpr, Vec<(EnumName, VariantName, BoundVariableName, BodyExpr)>)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -36,6 +39,7 @@ pub enum Type {
     F32,
     F64,
     Custom(String),
+    Enum(String),
     Array(Box<Type>, usize),
 }
 
@@ -50,6 +54,7 @@ impl Into<types::Type> for &Type {
             Type::F64 => types::F64,
             Type::Custom(..) => types::I64,
             Type::Array(..) => types::I64,
+            Type::Enum(..) => types::I64,
         }
     }
 }
@@ -94,6 +99,22 @@ impl<'a> Parser<'a> {
 
     pub fn new(tokens: &'a [Token]) -> Self {
         Parser { tokens, pos: 0 }
+    }
+
+    fn is_struct_init(&self) -> bool {
+        let mut temp_pos = self.pos;
+        if self.tokens.get(temp_pos) != Some(&Token::LBrace) {
+            return false;
+        }
+        temp_pos += 1;
+        match self.tokens.get(temp_pos) {
+            Some(Token::RBrace) => true,
+            Some(Token::Identifier(_)) => {
+                temp_pos += 1;
+                self.tokens.get(temp_pos) == Some(&Token::Colon)
+            }
+            _ => false,
+        }
     }
 
     fn parse_primary(&mut self) -> Option<Expr> {
@@ -152,7 +173,7 @@ impl<'a> Parser<'a> {
                         panic!("Expected ')' after arguments")
                     };
                     Some(Expr::Call(var_name, args))
-                } else if self.peek() == Some(&Token::LBrace) {
+                } else if self.is_struct_init() {
                     self.next();
                     let mut fields = Vec::new();
 
@@ -163,7 +184,7 @@ impl<'a> Parser<'a> {
                                 _ => panic!("Expected field name"),
                             };
                             let Some(Token::Colon) = self.next() else {
-                                panic!("Expected ':'")
+                                panic!("Expected ':' after field name in struct initialization")
                             };
 
                             let field_value =
@@ -181,6 +202,25 @@ impl<'a> Parser<'a> {
                         panic!("Expected '}}'")
                     };
                     Some(Expr::StructInit(var_name, fields))
+                } else if self.peek() == Some(&Token::DoubleColon) {
+                    self.next();
+
+                    let variant_name = match self.next() {
+                        Some(Token::Identifier(n)) => n.clone(),
+                        _ => panic!("Expected variant name after '::'"),
+                    };
+
+                    let mut payload = None;
+                    if self.peek() == Some(&Token::LParen) {
+                        self.next();
+                        payload =
+                            Some(Box::new(self.parse_expression().expect("Expected payload")));
+                        let Some(Token::RParen) = self.next() else {
+                            panic!("Expected ')'")
+                        };
+                    }
+
+                    Some(Expr::EnumInit(var_name, variant_name, payload))
                 } else {
                     Some(Expr::Variable(var_name))
                 }
@@ -368,6 +408,7 @@ impl<'a> Parser<'a> {
             Some(Token::Fn) => self.parse_fn_decl(),
             Some(Token::Let) => self.parse_var_decl(),
             Some(Token::Struct) => self.parse_struct_decl(),
+            Some(Token::Enum) => self.parse_enum_decl(),
             _ => self.parse_expression(),
         }
     }
@@ -444,12 +485,69 @@ impl<'a> Parser<'a> {
             Some(Token::If) => self.parse_if(),
             Some(Token::Loop) => self.parse_loop(),
             Some(Token::Break) => self.parse_break(),
+            Some(Token::Match) => self.parse_match(),
             Some(Token::Continue) => {
                 self.next();
                 Some(Expr::Continue)
             }
             _ => self.parse_relational(),
         }
+    }
+
+    fn parse_match(&mut self) -> Option<Expr> {
+        self.next();
+        let target = self.parse_expression()?;
+
+        let Some(Token::LBrace) = self.next() else {
+            panic!("Expected '{{' after match target")
+        };
+
+        let mut arms = Vec::new();
+        while self.peek() != Some(&Token::RBrace) {
+            let enum_name = match self.next() {
+                Some(Token::Identifier(n)) => n.clone(),
+                _ => panic!("Expected Enum name in match arm"),
+            };
+
+            let Some(Token::DoubleColon) = self.next() else {
+                panic!("Expected '::'")
+            };
+
+            let variant_name = match self.next() {
+                Some(Token::Identifier(n)) => n.clone(),
+                _ => panic!("Expected Variant name"),
+            };
+
+            let mut bind_name = None;
+            if self.peek() == Some(&Token::LParen) {
+                self.next();
+                bind_name = match self.next() {
+                    Some(Token::Identifier(n)) => Some(n.clone()),
+                    _ => panic!("Expected binding variable name"),
+                };
+                let Some(Token::RParen) = self.next() else {
+                    panic!("Expected ')'")
+                };
+            }
+
+            let Some(Token::FatArrow) = self.next() else {
+                panic!("Expected '=>'")
+            };
+            let body = self.parse_expression()?;
+
+            arms.push((enum_name, variant_name, bind_name, Box::new(body)));
+
+            if self.peek() == Some(&Token::Comma) {
+                self.next();
+            } else {
+                break;
+            }
+        }
+
+        let Some(Token::RBrace) = self.next() else {
+            panic!("Expected '}}'")
+        };
+        Some(Expr::Match(Box::new(target), arms))
     }
 
     fn parse_break(&mut self) -> Option<Expr> {
@@ -467,10 +565,18 @@ impl<'a> Parser<'a> {
 
         let mut exprs = Vec::new();
         while self.peek().is_some() && self.peek() != Some(&Token::RBrace) {
+            if self.peek() == Some(&Token::Semicolon) {
+                self.next();
+                continue;
+            }
+
             if let Some(expr) = self.parse_declaration() {
                 exprs.push(expr);
             } else {
-                panic!("Failed to parse expression in block");
+                panic!(
+                    "Failed to parse expression in block at token: {:?}",
+                    self.peek()
+                );
             }
         }
 
@@ -532,12 +638,60 @@ impl<'a> Parser<'a> {
         Some(Expr::FnDecl(name, params, return_type, Box::new(body)))
     }
 
+    fn parse_enum_decl(&mut self) -> Option<Expr> {
+        self.next();
+
+        let name = match self.next() {
+            Some(Token::Identifier(n)) => n.clone(),
+            _ => panic!("Expected enum name"),
+        };
+
+        let Some(Token::LBrace) = self.next() else {
+            panic!("Expected '{{'")
+        };
+
+        let mut variants = Vec::new();
+        while self.peek() != Some(&Token::RBrace) {
+            let v_name = match self.next() {
+                Some(Token::Identifier(n)) => n.clone(),
+                _ => panic!("Expected variant name"),
+            };
+
+            let mut v_type = None;
+            if self.peek() == Some(&Token::LParen) {
+                self.next(); // Consume '('
+                v_type = Some(self.parse_type());
+                let Some(Token::RParen) = self.next() else {
+                    panic!("Expected ')'")
+                };
+            }
+
+            variants.push((v_name, v_type));
+
+            if self.peek() == Some(&Token::Comma) {
+                self.next();
+            } else {
+                break;
+            }
+        }
+
+        let Some(Token::RBrace) = self.next() else {
+            panic!("Expected '}}'")
+        };
+        Some(Expr::EnumDecl(name, variants))
+    }
+
     pub fn parse(&mut self) -> Vec<Expr> {
         let mut program = Vec::new();
 
         loop {
             if self.peek().is_none_or(|t| *t == Token::EOF) {
                 break;
+            }
+
+            if self.peek() == Some(&Token::Semicolon) {
+                self.next();
+                continue;
             }
 
             if let Some(expr) = self.parse_declaration() {

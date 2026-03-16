@@ -22,6 +22,13 @@ pub enum TypedExpr {
     FieldAccess(Box<TypedExpr>, String, Type),
     ArrayInit(Vec<TypedExpr>, Type),
     Index(Box<TypedExpr>, Box<TypedExpr>, Type),
+    EnumDecl(String, Vec<(String, Option<Type>)>),
+    EnumInit(String, String, Option<Box<TypedExpr>>),
+    Match(
+        Box<TypedExpr>,
+        Vec<(String, String, Option<String>, Box<TypedExpr>)>,
+        Type,
+    ),
 }
 
 impl TypedExpr {
@@ -38,11 +45,14 @@ impl TypedExpr {
             | TypedExpr::FieldAccess(_, _, t)
             | TypedExpr::ArrayInit(_, t)
             | TypedExpr::Index(_, _, t)
+            | TypedExpr::Match(_, _, t)
             | TypedExpr::Call(_, _, t) => t.clone(),
             TypedExpr::Break(e) => e.ty(),
             TypedExpr::Float(_) => Type::F64,
+            TypedExpr::EnumInit(name, _, _) => Type::Custom(name.clone()),
             TypedExpr::Continue => Type::I64,
             TypedExpr::FnDecl(..) => Type::I64,
+            TypedExpr::EnumDecl(..) => Type::I64,
             TypedExpr::StructDecl(..) => Type::I64,
             TypedExpr::StructInit(name, _) => Type::Custom(name.clone()),
         }
@@ -71,10 +81,17 @@ pub struct StructLayout {
     pub fields: HashMap<String, (Type, i32)>, // maps field name to its (type, byte_offset)
 }
 
+#[derive(Clone)]
+pub struct EnumLayout {
+    pub size: u32,
+    pub variants: HashMap<String, (u32, Option<Type>)>, // maps VariantName -> (Integer Tag, Payload Type)
+}
+
 pub struct TypeChecker {
     variables: HashMap<String, Type>,
     functions: HashMap<String, (Vec<Type>, Type)>,
     structs: HashMap<String, StructLayout>,
+    enums: HashMap<String, EnumLayout>,
     loop_break_type: Option<Type>,
 }
 
@@ -86,6 +103,7 @@ impl TypeChecker {
             variables: HashMap::new(),
             functions,
             structs: HashMap::new(),
+            enums: HashMap::new(),
             loop_break_type: None,
         }
     }
@@ -111,6 +129,21 @@ impl TypeChecker {
                         StructLayout {
                             size: offset as u32,
                             fields: layout,
+                        },
+                    );
+                }
+                Expr::EnumDecl(name, variants) => {
+                    let mut layout = HashMap::new();
+                    let mut tag_counter = 0;
+                    for (v_name, v_ty) in variants {
+                        layout.insert(v_name.clone(), (tag_counter, v_ty.clone()));
+                        tag_counter += 1;
+                    }
+                    self.enums.insert(
+                        name.clone(),
+                        EnumLayout {
+                            size: 16,
+                            variants: layout,
                         },
                     );
                 }
@@ -495,6 +528,139 @@ impl TypeChecker {
                     Box::new(t_array),
                     Box::new(t_index),
                     inner_ty,
+                ))
+            }
+            Expr::EnumDecl(name, variants) => {
+                Ok(TypedExpr::EnumDecl(name.clone(), variants.clone()))
+            }
+            Expr::EnumInit(enum_name, variant_name, payload) => {
+                let expected_payload_ty = {
+                    let layout = self
+                        .enums
+                        .get(enum_name)
+                        .ok_or_else(|| format!("Type Error: Unknown enum '{}'", enum_name))?;
+
+                    let (_, expected_ty) = layout.variants.get(variant_name).ok_or_else(|| {
+                        format!(
+                            "Type Error: Enum '{}' has no variant '{}'",
+                            enum_name, variant_name
+                        )
+                    })?;
+
+                    expected_ty.clone()
+                };
+
+                let mut t_payload = None;
+                if let Some(p) = payload {
+                    let mut eval_p = self.check_expr(p)?;
+
+                    if let Some(expected_ty) = &expected_payload_ty {
+                        // literal coercion
+                        if let TypedExpr::Number(n, _) = &mut eval_p {
+                            if expected_ty.is_integer_type() {
+                                eval_p = TypedExpr::Number(*n, expected_ty.clone());
+                            }
+                        }
+
+                        if eval_p.ty() != *expected_ty {
+                            return Err(format!(
+                                "Type Error: Variant '{}::{}' expects payload of type {:?}, got {:?}",
+                                enum_name,
+                                variant_name,
+                                expected_ty,
+                                eval_p.ty()
+                            ));
+                        }
+                    } else {
+                        return Err(format!(
+                            "Type Error: Variant '{}::{}' does not take a payload",
+                            enum_name, variant_name
+                        ));
+                    }
+                    t_payload = Some(Box::new(eval_p));
+                } else if expected_payload_ty.is_some() {
+                    return Err(format!(
+                        "Type Error: Variant '{}::{}' expects a payload",
+                        enum_name, variant_name
+                    ));
+                }
+
+                Ok(TypedExpr::EnumInit(
+                    enum_name.clone(),
+                    variant_name.clone(),
+                    t_payload,
+                ))
+            }
+            Expr::Match(target, arms) => {
+                let t_target = self.check_expr(target)?;
+
+                let Type::Custom(enum_name) = t_target.ty() else {
+                    return Err(format!(
+                        "Type Error: Cannot match on non-enum type {:?}",
+                        t_target.ty()
+                    ));
+                };
+
+                let layout = self.enums.get(&enum_name).unwrap().clone();
+                let mut t_arms = Vec::new();
+                let mut return_ty = None;
+
+                for (arm_enum_name, variant_name, bind_name, body) in arms {
+                    if *arm_enum_name != enum_name {
+                        return Err(format!(
+                            "Type Error: Match arm enum mismatch. Expected '{}', got '{}'",
+                            enum_name, arm_enum_name
+                        ));
+                    }
+
+                    let (_, expected_payload_ty) =
+                        layout.variants.get(variant_name).ok_or_else(|| {
+                            format!("Type Error: Variant '{}' does not exist", variant_name)
+                        })?;
+
+                    // get the bound variable into the scope for the body evaluation
+                    let previous_vars = std::mem::take(&mut self.variables);
+                    self.variables = previous_vars.clone(); // shallow scope copy
+
+                    if let Some(b_name) = bind_name {
+                        if let Some(p_ty) = expected_payload_ty {
+                            self.variables.insert(b_name.clone(), p_ty.clone());
+                        } else {
+                            return Err(format!(
+                                "Type Error: Cannot bind variable. Variant '{}' has no payload.",
+                                variant_name
+                            ));
+                        }
+                    }
+
+                    let t_body = self.check_expr(body)?;
+
+                    // verify all match arms return the exact same type
+                    if let Some(r_ty) = &return_ty {
+                        if *r_ty != t_body.ty() {
+                            return Err(format!(
+                                "Type Error: Match arms have incompatible return types: {:?} and {:?}",
+                                r_ty,
+                                t_body.ty()
+                            ));
+                        }
+                    } else {
+                        return_ty = Some(t_body.ty());
+                    }
+
+                    t_arms.push((
+                        arm_enum_name.clone(),
+                        variant_name.clone(),
+                        bind_name.clone(),
+                        Box::new(t_body),
+                    ));
+                    self.variables = previous_vars;
+                }
+
+                Ok(TypedExpr::Match(
+                    Box::new(t_target),
+                    t_arms,
+                    return_ty.unwrap_or(Type::I64),
                 ))
             }
         }

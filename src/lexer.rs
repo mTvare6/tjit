@@ -25,6 +25,8 @@ pub enum Token {
     Continue,
     Fn,
     Struct,
+    Enum,
+    Match,
 
     // Relational
     LessThan,
@@ -46,7 +48,9 @@ pub enum Token {
     Comma,
     Semicolon,
     Colon,
+    DoubleColon,
     Arrow,
+    FatArrow,
 }
 
 pub struct Lexer<'a> {
@@ -107,6 +111,8 @@ impl<'a> Lexer<'a> {
             "loop" => Token::Loop,
             "fn" => Token::Fn,
             "struct" => Token::Struct,
+            "enum" => Token::Enum,
+            "match" => Token::Match,
             _ => Token::Identifier(ident),
         }
     }
@@ -144,6 +150,10 @@ impl<'a> Lexer<'a> {
                 }
                 ':' => {
                     self.chars.next();
+                    if self.chars.peek() == Some(&':') {
+                        self.chars.next();
+                        return Token::DoubleColon;
+                    }
                     return Token::Colon;
                 }
                 ';' => {
@@ -159,6 +169,10 @@ impl<'a> Lexer<'a> {
                     if self.chars.peek() == Some(&'=') {
                         self.chars.next();
                         return Token::Equal;
+                    }
+                    if self.chars.peek() == Some(&'>') {
+                        self.chars.next();
+                        return Token::FatArrow;
                     }
                     return Token::Assign;
                 }
