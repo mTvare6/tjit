@@ -51,6 +51,8 @@ pub enum Token {
     DoubleColon,
     Arrow,
     FatArrow,
+    DotDot,
+    DotDotEqual,
 }
 
 pub struct Lexer<'a> {
@@ -73,6 +75,12 @@ impl<'a> Lexer<'a> {
                 number_str.push(ch);
                 self.chars.next();
             } else if ch == '.' && !is_float {
+                let mut lookahead = self.chars.clone();
+                lookahead.next();
+                if lookahead.peek() == Some(&'.') {
+                    break;
+                }
+
                 is_float = true;
                 number_str.push(ch);
                 self.chars.next();
@@ -162,6 +170,14 @@ impl<'a> Lexer<'a> {
                 }
                 '.' => {
                     self.chars.next();
+                    if self.chars.peek() == Some(&'.') {
+                        self.chars.next();
+                        if self.chars.peek() == Some(&'=') {
+                            self.chars.next();
+                            return Token::DotDotEqual;
+                        }
+                        return Token::DotDot;
+                    }
                     return Token::Dot;
                 }
                 '=' => {

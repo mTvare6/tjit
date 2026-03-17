@@ -1,5 +1,7 @@
 use crate::parser::{Op, Type};
-use crate::type_system::{EnumLayout, StructLayout, TypedExpr, align_to, size_and_align_of};
+use crate::type_system::{
+    EnumLayout, StructLayout, TypedExpr, TypedPat, align_to, size_and_align_of,
+};
 use cranelift::prelude::*;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
@@ -12,6 +14,22 @@ type VariableMap = HashMap<String, Variable>;
 extern "C" fn print_i64(val: i64) -> i64 {
     println!("=> {}", val);
     0
+}
+
+// Helper to mimic C's `memcpy` for inline Value Semantics
+fn emit_memory_copy(builder: &mut FunctionBuilder, src_ptr: Value, dest_ptr: Value, size: u32) {
+    // A production compiler links the OS `memcpy`, but for our JIT,
+    // unrolling an 8-byte chunk loop is blazing fast and perfectly fine.
+    let mut offset = 0;
+    while offset < size {
+        let chunk = builder
+            .ins()
+            .load(types::I64, MemFlags::new(), src_ptr, offset as i32);
+        builder
+            .ins()
+            .store(MemFlags::new(), chunk, dest_ptr, offset as i32);
+        offset += 8;
+    }
 }
 
 // for selecting arithmetic instructions
@@ -159,6 +177,123 @@ impl JITEngine {
 
         // clear the context so we can reuse the engine for the next script
         Ok(())
+    }
+
+    // recursive decision tree generator
+    fn emit_pattern_match(
+        builder: &mut FunctionBuilder,
+        pat: &TypedPat,
+        ptr: Value,        // physical memory address being inspected
+        fail_block: Block, // wildcard if all fails
+        variables: &mut VariableMap,
+        variable_index: &mut usize,
+        structs: &HashMap<String, StructLayout>,
+        enums: &HashMap<String, EnumLayout>,
+    ) {
+        match pat {
+            TypedPat::Wildcard(_) => { /* always match, emit nothing */ }
+            TypedPat::Number(n, p_ty) => {
+                let cl_type = p_ty.into();
+                let val = builder.ins().load(cl_type, MemFlags::new(), ptr, 0);
+                let expected = builder.ins().iconst(cl_type, *n);
+                let is_match = builder.ins().icmp(IntCC::Equal, val, expected);
+
+                let success_block = builder.create_block();
+                builder
+                    .ins()
+                    .brif(is_match, success_block, &[], fail_block, &[]);
+                builder.switch_to_block(success_block);
+                builder.seal_block(success_block);
+            }
+            TypedPat::Range(start, end, inclusive, p_ty) => {
+                let cl_type = p_ty.into();
+                let val = builder.ins().load(cl_type, MemFlags::new(), ptr, 0);
+                let s_val = builder.ins().iconst(cl_type, *start);
+                let e_val = builder.ins().iconst(cl_type, *end);
+
+                let cmp_start = builder
+                    .ins()
+                    .icmp(IntCC::SignedGreaterThanOrEqual, val, s_val);
+                let cmp_end = if *inclusive {
+                    builder.ins().icmp(IntCC::SignedLessThanOrEqual, val, e_val)
+                } else {
+                    builder.ins().icmp(IntCC::SignedLessThan, val, e_val)
+                };
+
+                let in_bounds = builder.ins().band(cmp_start, cmp_end);
+
+                let success_block = builder.create_block();
+                builder
+                    .ins()
+                    .brif(in_bounds, success_block, &[], fail_block, &[]);
+                builder.switch_to_block(success_block);
+                builder.seal_block(success_block);
+            }
+
+            TypedPat::Variable(name, p_ty) => {
+                // load the value and bind it to a cl variable
+                let val = builder.ins().load(p_ty.into(), MemFlags::new(), ptr, 0);
+                let var = Variable::new(*variable_index);
+                *variable_index += 1;
+                builder.declare_var(var, p_ty.into());
+                builder.def_var(var, val);
+                variables.insert(name.clone(), var);
+            }
+
+            TypedPat::Enum(enum_name, variant_name, payloads, _) => {
+                let layout = enums.get(enum_name).unwrap();
+                let (expected_tag, expected_payload_tys) =
+                    layout.variants.get(variant_name).unwrap();
+
+                // 1. Check the Tag at offset 0
+                let tag_val = builder.ins().load(types::I32, MemFlags::new(), ptr, 0);
+                let expected_tag_val = builder.ins().iconst(types::I32, *expected_tag as i64);
+                let is_match = builder.ins().icmp(IntCC::Equal, tag_val, expected_tag_val);
+
+                let success_block = builder.create_block();
+                builder
+                    .ins()
+                    .brif(is_match, success_block, &[], fail_block, &[]);
+                builder.switch_to_block(success_block);
+                builder.seal_block(success_block);
+
+                // 2. Recursively check every nested payload!
+                for (i, p) in payloads.iter().enumerate() {
+                    let (_, offset) = expected_payload_tys[i];
+                    let payload_ptr = builder.ins().iadd_imm(ptr, offset as i64);
+                    Self::emit_pattern_match(
+                        builder,
+                        p,
+                        payload_ptr,
+                        fail_block,
+                        variables,
+                        variable_index,
+                        structs,
+                        enums,
+                    );
+                }
+            }
+
+            TypedPat::Struct(struct_name, fields, _) => {
+                let layout = structs.get(struct_name).unwrap();
+
+                // Structs don't have tags, we just recursively check the inner fields
+                for (f_name, f_pat) in fields {
+                    let (_, offset) = layout.fields.get(f_name).unwrap();
+                    let field_ptr = builder.ins().iadd_imm(ptr, *offset as i64);
+                    Self::emit_pattern_match(
+                        builder,
+                        f_pat,
+                        field_ptr,
+                        fail_block,
+                        variables,
+                        variable_index,
+                        structs,
+                        enums,
+                    );
+                }
+            }
+        }
     }
 
     pub fn compile(
@@ -719,16 +854,23 @@ impl JITEngine {
                         enums,
                     )?;
 
-                    let (_, offset) = field_layouts[i];
-                    builder
-                        .ins()
-                        .store(MemFlags::new(), p_val, base_ptr, offset);
+                    let (expected_ty, offset) = &field_layouts[i];
+
+                    if expected_ty.is_primitive() {
+                        builder
+                            .ins()
+                            .store(MemFlags::new(), p_val, base_ptr, *offset);
+                    } else {
+                        let (p_size, _) = size_and_align_of(expected_ty, structs, enums);
+                        let dest_ptr = builder.ins().iadd_imm(base_ptr, *offset as i64);
+                        emit_memory_copy(builder, p_val, dest_ptr, p_size);
+                    }
                 }
                 Some(base_ptr)
             }
             TypedExpr::Match(target, arms, ret_ty) => {
-                // evaluate the target to get the base pointer
-                let base_ptr = Self::compile_expr(
+                let target_ty = target.ty();
+                let target_val = Self::compile_expr(
                     target,
                     module,
                     builder,
@@ -739,59 +881,45 @@ impl JITEngine {
                     enums,
                 )?;
 
-                // load the tag from byte offset 0
-                let tag_val = builder.ins().load(types::I32, MemFlags::new(), base_ptr, 0);
+                let base_ptr = if target_ty.is_integer_type()
+                    || target_ty == Type::F64
+                    || target_ty == Type::F32
+                {
+                    let slot_data = StackSlotData::new(StackSlotKind::ExplicitSlot, 8);
+                    let slot = builder.create_sized_stack_slot(slot_data);
+                    let ptr = builder.ins().stack_addr(types::I64, slot, 0);
+                    builder.ins().store(MemFlags::new(), target_val, ptr, 0);
+                    ptr
+                } else {
+                    target_val // Arrays, Structs, and Enums are already memory pointers
+                };
 
-                // setup the exit block for when a match arm finishes
                 let merge_block = builder.create_block();
                 builder.append_block_param(merge_block, ret_ty.into());
 
-                let mut next_block = builder.create_block();
+                let mut current_check_block = builder.create_block();
+                builder.ins().jump(current_check_block, &[]);
 
-                builder.ins().jump(next_block, &[]);
+                for (pat, body) in arms {
+                    builder.switch_to_block(current_check_block);
+                    builder.seal_block(current_check_block);
 
-                // build the cascading decision tree
-                for (arm_enum, variant_name, bind_names, body) in arms {
-                    let layout = enums.get(arm_enum).unwrap();
-                    let (expected_tag, expected_payload_tys) =
-                        layout.variants.get(variant_name).unwrap();
+                    // block to jump to if the pattern fails
+                    let next_check_block = builder.create_block();
 
-                    builder.switch_to_block(next_block);
-                    builder.seal_block(next_block);
+                    // emit the recursive decision tree
+                    Self::emit_pattern_match(
+                        builder,
+                        pat,
+                        base_ptr,
+                        next_check_block,
+                        variables,
+                        variable_index,
+                        structs,
+                        enums,
+                    );
 
-                    // check if RAM tag == expected tag
-                    let expected_tag_val = builder.ins().iconst(types::I32, *expected_tag as i64);
-                    let is_match = builder.ins().icmp(IntCC::Equal, tag_val, expected_tag_val);
-
-                    let arm_block = builder.create_block();
-                    next_block = builder.create_block(); // prepare the block for the next arm to check
-
-                    // branch execution
-                    builder
-                        .ins()
-                        .brif(is_match, arm_block, &[], next_block, &[]);
-
-                    // inside the successful match arm
-                    builder.switch_to_block(arm_block);
-                    builder.seal_block(arm_block);
-
-                    // If written `Some(val) =>`, bind `val` to the payload in RAM
-                    let p_tys = expected_payload_tys;
-                    for (i, b_name) in bind_names.iter().enumerate() {
-                        let (p_ty, offset) = &expected_payload_tys[i];
-
-                        let p_val =
-                            builder
-                                .ins()
-                                .load(p_ty.into(), MemFlags::new(), base_ptr, *offset);
-
-                        let var = Variable::new(*variable_index);
-                        *variable_index += 1;
-                        builder.declare_var(var, p_ty.into());
-                        builder.def_var(var, p_val);
-                        variables.insert(b_name.clone(), var);
-                    }
-
+                    // if emit_pattern_match didn't jump to next_check_block
                     let body_val = Self::compile_expr(
                         body,
                         module,
@@ -802,14 +930,18 @@ impl JITEngine {
                         structs,
                         enums,
                     );
+
                     if let Some(v) = body_val {
                         builder.ins().jump(merge_block, &[v]);
                     }
+
+                    // move to the fail block for the next iteration
+                    current_check_block = next_check_block;
                 }
 
-                // fallback if no arms match (rust ensures exhaustiveness at compile time, but trap in the JIT to be safe)
-                builder.switch_to_block(next_block);
-                builder.seal_block(next_block);
+                // when all arms fails, trap
+                builder.switch_to_block(current_check_block);
+                builder.seal_block(current_check_block);
                 builder.ins().trap(TrapCode::UnreachableCodeReached);
 
                 builder.switch_to_block(merge_block);

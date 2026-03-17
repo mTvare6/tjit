@@ -34,7 +34,7 @@ fn main() {
     match jit.compile(&typed_ast, &typechecker.structs, &typechecker.enums) {
         Ok(jit_fn) => {
             let result = jit_fn();
-            println!("Program Exited with code: {}", result);
+            println!("{}", result);
         }
         Err(e) => println!("Compilation failed: {}", e),
     }

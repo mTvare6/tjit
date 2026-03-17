@@ -23,7 +23,7 @@ pub enum Expr {
     Index(Box<Expr>, Box<Expr>),
     EnumDecl(String, Vec<(String, Vec<Type>)>),
     EnumInit(String, String, Vec<Expr>),
-    Match(Box<Expr>, Vec<(String, String, Vec<String>, Box<Expr>)>),
+    Match(Box<Expr>, Vec<(Pat, Box<Expr>)>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -73,6 +73,16 @@ pub enum Op {
     Ge,
 }
 
+#[derive(Debug, Clone)]
+pub enum Pat {
+    Wildcard,
+    Number(i64),
+    Range(i64, i64, bool),
+    Variable(String),
+    Struct(String, Vec<(String, Pat)>),
+    Enum(String, String, Vec<Pat>),
+}
+
 pub struct Parser<'a> {
     tokens: &'a [Token],
     pos: usize,
@@ -114,6 +124,101 @@ impl<'a> Parser<'a> {
                 self.tokens.get(temp_pos) == Some(&Token::Colon)
             }
             _ => false,
+        }
+    }
+
+    fn parse_pattern(&mut self) -> Pat {
+        match self.peek() {
+            Some(Token::Number(n)) => {
+                let start_val = *n;
+                self.next();
+
+                if self.peek() == Some(&Token::DotDot) {
+                    self.next();
+                    let end_val = match self.next() {
+                        Some(Token::Number(end)) => *end,
+                        _ => panic!("Expected a number to end the range"),
+                    };
+                    return Pat::Range(start_val, end_val, false);
+                } else if self.peek() == Some(&Token::DotDotEqual) {
+                    self.next();
+                    let end_val = match self.next() {
+                        Some(Token::Number(end)) => *end,
+                        _ => panic!("Expected a number to end the inclusive range"),
+                    };
+                    return Pat::Range(start_val, end_val, true);
+                }
+
+                Pat::Number(start_val)
+            }
+            Some(Token::Identifier(name)) => {
+                let name = name.clone();
+                self.next();
+
+                if name == "_" {
+                    return Pat::Wildcard;
+                }
+
+                if self.peek() == Some(&Token::DoubleColon) {
+                    self.next();
+
+                    let variant_name = match self.next() {
+                        Some(Token::Identifier(n)) => n.clone(),
+                        _ => panic!("Expected variant name in pattern"),
+                    };
+
+                    let mut payloads = Vec::new();
+                    if self.peek() == Some(&Token::LParen) {
+                        self.next();
+                        if self.peek() != Some(&Token::RParen) {
+                            loop {
+                                payloads.push(self.parse_pattern());
+                                if self.peek() == Some(&Token::Comma) {
+                                    self.next();
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                        let Some(Token::RParen) = self.next() else {
+                            panic!("Expected ')'")
+                        };
+                    }
+                    return Pat::Enum(name, variant_name, payloads);
+                } else if self.peek() == Some(&Token::LBrace) {
+                    self.next();
+
+                    let mut fields = Vec::new();
+                    if self.peek() != Some(&Token::RBrace) {
+                        loop {
+                            let field_name = match self.next() {
+                                Some(Token::Identifier(n)) => n.clone(),
+                                _ => panic!("Expected field name in struct pattern"),
+                            };
+
+                            let Some(Token::Colon) = self.next() else {
+                                panic!("Expected ':' after field name in struct pattern")
+                            };
+
+                            let field_pat = self.parse_pattern();
+                            fields.push((field_name, field_pat));
+
+                            if self.peek() == Some(&Token::Comma) {
+                                self.next();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    let Some(Token::RBrace) = self.next() else {
+                        panic!("Expected '}}'")
+                    };
+                    return Pat::Struct(name, fields);
+                } else {
+                    Pat::Variable(name)
+                }
+            }
+            _ => panic!("Expected a valid pattern, found {:?}", self.peek()),
         }
     }
 
@@ -513,48 +618,17 @@ impl<'a> Parser<'a> {
 
         let mut arms = Vec::new();
         while self.peek() != Some(&Token::RBrace) {
-            let enum_name = match self.next() {
-                Some(Token::Identifier(n)) => n.clone(),
-                _ => panic!("Expected Enum name in match arm"),
-            };
-
-            let Some(Token::DoubleColon) = self.next() else {
-                panic!("Expected '::'")
-            };
-
-            let variant_name = match self.next() {
-                Some(Token::Identifier(n)) => n.clone(),
-                _ => panic!("Expected Variant name"),
-            };
-
-            let mut bind_names = Vec::new();
-            if self.peek() == Some(&Token::LParen) {
-                self.next();
-                if self.peek() != Some(&Token::RParen) {
-                    loop {
-                        let b_name = match self.next() {
-                            Some(Token::Identifier(n)) => n.clone(),
-                            _ => panic!("Expected binding variable name"),
-                        };
-                        bind_names.push(b_name);
-                        if self.peek() == Some(&Token::Comma) {
-                            self.next();
-                        } else {
-                            break;
-                        }
-                    }
-                }
-                let Some(Token::RParen) = self.next() else {
-                    panic!("Expected ')'")
-                };
-            }
+            // 1. Parse ANY generalized pattern!
+            let pat = self.parse_pattern();
 
             let Some(Token::FatArrow) = self.next() else {
-                panic!("Expected '=>'")
+                panic!("Expected '=>' after pattern")
             };
+
+            // 2. Parse the body expression
             let body = self.parse_expression()?;
 
-            arms.push((enum_name, variant_name, bind_names, Box::new(body)));
+            arms.push((pat, Box::new(body)));
 
             if self.peek() == Some(&Token::Comma) {
                 self.next();
@@ -564,8 +638,9 @@ impl<'a> Parser<'a> {
         }
 
         let Some(Token::RBrace) = self.next() else {
-            panic!("Expected '}}'")
+            panic!("Expected '}}' at end of match")
         };
+
         Some(Expr::Match(Box::new(target), arms))
     }
 

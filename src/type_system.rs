@@ -1,3 +1,4 @@
+use crate::parser::Pat;
 use crate::parser::{Expr, Op, Type};
 use std::collections::HashMap;
 
@@ -33,6 +34,7 @@ pub fn size_and_align_of(
 }
 
 // typed intermediate representation (=MIR)
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum TypedExpr {
     Number(i64, Type),
@@ -55,11 +57,7 @@ pub enum TypedExpr {
     Index(Box<TypedExpr>, Box<TypedExpr>, Type),
     EnumDecl(String, Vec<(String, Vec<Type>)>),
     EnumInit(String, String, Vec<TypedExpr>),
-    Match(
-        Box<TypedExpr>,
-        Vec<(String, String, Vec<String>, Box<TypedExpr>)>,
-        Type,
-    ),
+    Match(Box<TypedExpr>, Vec<(TypedPat, Box<TypedExpr>)>, Type),
 }
 
 impl TypedExpr {
@@ -91,7 +89,7 @@ impl TypedExpr {
 }
 
 impl Type {
-    fn is_integer_type(&self) -> bool {
+    pub fn is_integer_type(&self) -> bool {
         matches!(
             self,
             Type::I64
@@ -103,6 +101,47 @@ impl Type {
                 | Type::U16
                 | Type::U8
         )
+    }
+
+    pub fn is_primitive(&self) -> bool {
+        matches!(
+            self,
+            Type::I8
+                | Type::I16
+                | Type::I32
+                | Type::I64
+                | Type::U8
+                | Type::U16
+                | Type::U32
+                | Type::U64
+                | Type::F32
+                | Type::F64
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub enum TypedPat {
+    Wildcard(Type),
+    Number(i64, Type),
+    Range(i64, i64, bool, Type),
+    Variable(String, Type),
+    Struct(String, Vec<(String, TypedPat)>, Type),
+    Enum(String, String, Vec<TypedPat>, Type),
+}
+
+#[allow(dead_code)]
+impl TypedPat {
+    pub fn ty(&self) -> Type {
+        match self {
+            TypedPat::Wildcard(t)
+            | TypedPat::Number(_, t)
+            | TypedPat::Range(_, _, _, t)
+            | TypedPat::Variable(_, t)
+            | TypedPat::Struct(_, _, t)
+            | TypedPat::Enum(_, _, _, t) => t.clone(),
+        }
     }
 }
 
@@ -181,6 +220,119 @@ impl TypeChecker {
         }
 
         Ok(typed_program)
+    }
+
+    fn check_pattern(&mut self, pat: &Pat, expected_ty: &Type) -> Result<TypedPat, String> {
+        match pat {
+            Pat::Wildcard => Ok(TypedPat::Wildcard(expected_ty.clone())),
+            Pat::Number(n) => {
+                if !expected_ty.is_integer_type() {
+                    return Err(format!(
+                        "Type Error: Cannot match number {} against type {:?}",
+                        n, expected_ty
+                    ));
+                }
+                Ok(TypedPat::Number(*n, expected_ty.clone()))
+            }
+            Pat::Range(start, end, inclusive) => {
+                if !expected_ty.is_integer_type() {
+                    return Err(format!(
+                        "Type Error: Cannot match range against type {:?}",
+                        expected_ty
+                    ));
+                }
+                Ok(TypedPat::Range(
+                    *start,
+                    *end,
+                    *inclusive,
+                    expected_ty.clone(),
+                ))
+            }
+            Pat::Variable(name) => {
+                // if it's a variable, bind it to the current scope
+                self.variables.insert(name.clone(), expected_ty.clone());
+                Ok(TypedPat::Variable(name.clone(), expected_ty.clone()))
+            }
+            Pat::Struct(name, fields) => {
+                let Type::Custom(target_name) = expected_ty else {
+                    return Err(format!(
+                        "Type Error: Expected {:?}, but pattern is Struct '{}'",
+                        expected_ty, name
+                    ));
+                };
+                if name != target_name {
+                    return Err(format!(
+                        "Type Error: Mismatched structs in pattern. Expected '{}', got '{}'",
+                        target_name, name
+                    ));
+                }
+
+                let layout = self.structs.get(name).unwrap().clone();
+                let mut t_fields = Vec::new();
+
+                for (f_name, f_pat) in fields {
+                    let (f_ty, _) = layout.fields.get(f_name).ok_or_else(|| {
+                        format!("Type Error: Struct '{}' has no field '{}'", name, f_name)
+                    })?;
+
+                    // RECURSION: Validate the nested pattern against the field's type!
+                    let t_f_pat = self.check_pattern(f_pat, f_ty)?;
+                    t_fields.push((f_name.clone(), t_f_pat));
+                }
+                Ok(TypedPat::Struct(
+                    name.clone(),
+                    t_fields,
+                    expected_ty.clone(),
+                ))
+            }
+            Pat::Enum(enum_name, variant_name, payloads) => {
+                let Type::Custom(target_name) = expected_ty else {
+                    return Err(format!(
+                        "Type Error: Expected {:?}, but pattern is Enum '{}'",
+                        expected_ty, enum_name
+                    ));
+                };
+                if enum_name != target_name {
+                    return Err(format!(
+                        "Type Error: Mismatched enums in pattern. Expected '{}', got '{}'",
+                        target_name, enum_name
+                    ));
+                }
+
+                let layout = self.enums.get(enum_name).unwrap().clone();
+                let (_, expected_payload_tys) =
+                    layout.variants.get(variant_name).ok_or_else(|| {
+                        format!(
+                            "Type Error: Enum '{}' has no variant '{}'",
+                            enum_name, variant_name
+                        )
+                    })?;
+
+                if payloads.len() != expected_payload_tys.len() {
+                    return Err(format!(
+                        "Type Error: Variant '{}::{}' expects {} payloads, pattern provided {}",
+                        enum_name,
+                        variant_name,
+                        expected_payload_tys.len(),
+                        payloads.len()
+                    ));
+                }
+
+                let mut t_payloads = Vec::new();
+                for (p, (expected_p_ty, _)) in payloads.iter().zip(expected_payload_tys.iter()) {
+                    // RECURSION: Validate the nested payload pattern!
+                    let t_p = self.check_pattern(p, expected_p_ty)?;
+                    t_payloads.push(t_p);
+                }
+
+                Ok(TypedPat::Enum(
+                    enum_name.clone(),
+                    variant_name.clone(),
+                    t_payloads,
+                    expected_ty.clone(),
+                ))
+            }
+        }
     }
 
     // topological resolver
@@ -698,49 +850,23 @@ impl TypeChecker {
             }
             Expr::Match(target, arms) => {
                 let t_target = self.check_expr(target)?;
+                let target_ty = t_target.ty();
 
-                let Type::Custom(enum_name) = t_target.ty() else {
-                    return Err(format!(
-                        "Type Error: Cannot match on non-enum type {:?}",
-                        t_target.ty()
-                    ));
-                };
-
-                let layout = self.enums.get(&enum_name).unwrap().clone();
                 let mut t_arms = Vec::new();
                 let mut return_ty = None;
 
-                for (arm_enum_name, variant_name, bind_names, body) in arms {
-                    if *arm_enum_name != enum_name {
-                        return Err(format!(
-                            "Type Error: Match arm enum mismatch. Expected '{}', got '{}'",
-                            enum_name, arm_enum_name
-                        ));
-                    }
-
-                    let (_, expected_payload_tys) = layout.variants.get(variant_name).unwrap();
-
-                    if bind_names.len() != expected_payload_tys.len() {
-                        return Err(format!(
-                            "Type Error: Variant '{}' binds {} variables, but has {} payloads",
-                            variant_name,
-                            bind_names.len(),
-                            expected_payload_tys.len()
-                        ));
-                    }
-
+                for (pat, body) in arms {
+                    // isolate the scope for each match arm
                     let previous_vars = std::mem::take(&mut self.variables);
                     self.variables = previous_vars.clone();
 
-                    for (b_name, (p_ty, _offset)) in
-                        bind_names.iter().zip(expected_payload_tys.iter())
-                    {
-                        self.variables.insert(b_name.clone(), p_ty.clone());
-                    }
+                    // validate the pattern and automatically inject bindings
+                    let t_pat = self.check_pattern(pat, &target_ty)?;
 
+                    // evaluate the body with the newly bound variables
                     let t_body = self.check_expr(body)?;
 
-                    // verify all match arms return the exact same type
+                    // ensure all arms return the exact same type
                     if let Some(r_ty) = &return_ty {
                         if *r_ty != t_body.ty() {
                             return Err(format!(
@@ -753,12 +879,9 @@ impl TypeChecker {
                         return_ty = Some(t_body.ty());
                     }
 
-                    t_arms.push((
-                        arm_enum_name.clone(),
-                        variant_name.clone(),
-                        bind_names.clone(),
-                        Box::new(t_body),
-                    ));
+                    t_arms.push((t_pat, Box::new(t_body)));
+
+                    // restore the scope so variables don't leak into the next arm
                     self.variables = previous_vars;
                 }
 
