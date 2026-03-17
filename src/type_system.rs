@@ -16,6 +16,7 @@ pub fn size_and_align_of(
         Type::I16 | Type::U16 => (2, 2),
         Type::I32 | Type::U32 | Type::F32 => (4, 4),
         Type::I64 | Type::U64 | Type::F64 => (8, 8),
+        Type::String => (16, 8),
         Type::Array(inner, len) => {
             let (elem_size, align) = size_and_align_of(inner, structs, enums);
             let stride = align_to(elem_size, align);
@@ -58,6 +59,7 @@ pub enum TypedExpr {
     EnumDecl(String, Vec<(String, Vec<Type>)>),
     EnumInit(String, String, Vec<TypedExpr>),
     Match(Box<TypedExpr>, Vec<(TypedPat, Box<TypedExpr>)>, Type),
+    StringLiteral(String),
 }
 
 impl TypedExpr {
@@ -84,6 +86,7 @@ impl TypedExpr {
             TypedExpr::EnumDecl(..) => Type::I64,
             TypedExpr::StructDecl(..) => Type::I64,
             TypedExpr::StructInit(name, _) => Type::Custom(name.clone()),
+            TypedExpr::StringLiteral(_) => Type::String,
         }
     }
 }
@@ -173,6 +176,7 @@ impl TypeChecker {
     pub fn new() -> Self {
         let mut functions = HashMap::new();
         functions.insert(String::from("print"), (vec![Type::I64], Type::I64));
+        functions.insert(String::from("print_str"), (vec![Type::String], Type::I64));
         Self {
             variables: HashMap::new(),
             functions,
@@ -275,7 +279,7 @@ impl TypeChecker {
                         format!("Type Error: Struct '{}' has no field '{}'", name, f_name)
                     })?;
 
-                    // RECURSION: Validate the nested pattern against the field's type!
+                    // validate the nested pattern against the field's type
                     let t_f_pat = self.check_pattern(f_pat, f_ty)?;
                     t_fields.push((f_name.clone(), t_f_pat));
                 }
@@ -320,7 +324,7 @@ impl TypeChecker {
 
                 let mut t_payloads = Vec::new();
                 for (p, (expected_p_ty, _)) in payloads.iter().zip(expected_payload_tys.iter()) {
-                    // RECURSION: Validate the nested payload pattern!
+                    // validate the nested payload pattern
                     let t_p = self.check_pattern(p, expected_p_ty)?;
                     t_payloads.push(t_p);
                 }
@@ -421,6 +425,7 @@ impl TypeChecker {
 
     fn check_expr(&mut self, expr: &Expr) -> Result<TypedExpr, String> {
         match expr {
+Expr::StringLiteral(s) => Ok(TypedExpr::StringLiteral(s.clone())),
             Expr::Number(n) => Ok(TypedExpr::Number(*n, Type::I64)), // default until coerced
             Expr::Float(f) => Ok(TypedExpr::Float(*f)),
             Expr::Variable(name) => {

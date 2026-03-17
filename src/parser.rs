@@ -24,6 +24,7 @@ pub enum Expr {
     EnumDecl(String, Vec<(String, Vec<Type>)>),
     EnumInit(String, String, Vec<Expr>),
     Match(Box<Expr>, Vec<(Pat, Box<Expr>)>),
+    StringLiteral(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -40,6 +41,7 @@ pub enum Type {
     F64,
     Custom(String),
     Enum(String),
+    String,
     Array(Box<Type>, usize),
 }
 
@@ -55,6 +57,7 @@ impl Into<types::Type> for &Type {
             Type::Custom(..) => types::I64,
             Type::Array(..) => types::I64,
             Type::Enum(..) => types::I64,
+            Type::String => types::I64,
         }
     }
 }
@@ -224,6 +227,11 @@ impl<'a> Parser<'a> {
 
     fn parse_primary(&mut self) -> Option<Expr> {
         let expr = match self.peek()? {
+            Token::StringLiteral(s) => {
+                let val = s.clone();
+                self.next();
+                Some(Expr::StringLiteral(val))
+            }
             Token::LBracket => {
                 self.next();
                 let mut elements = Vec::new();
@@ -398,6 +406,7 @@ impl<'a> Parser<'a> {
                 "u64" => Type::U64,
                 "f32" => Type::F32,
                 "f64" => Type::F64,
+                "String" => Type::String,
                 _ => Type::Custom(type_name.clone()),
             };
             self.next();
@@ -618,14 +627,12 @@ impl<'a> Parser<'a> {
 
         let mut arms = Vec::new();
         while self.peek() != Some(&Token::RBrace) {
-            // 1. Parse ANY generalized pattern!
             let pat = self.parse_pattern();
 
             let Some(Token::FatArrow) = self.next() else {
                 panic!("Expected '=>' after pattern")
             };
 
-            // 2. Parse the body expression
             let body = self.parse_expression()?;
 
             arms.push((pat, Box::new(body)));

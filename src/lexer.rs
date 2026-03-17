@@ -7,6 +7,7 @@ pub enum Token {
     Number(i64),
     Float(f64),
     Identifier(String),
+    StringLiteral(String),
 
     // Operators
     Plus,
@@ -191,6 +192,19 @@ impl<'a> Lexer<'a> {
                         return Token::FatArrow;
                     }
                     return Token::Assign;
+                }
+                '"' => {
+                    self.chars.next();
+                    let mut string_val = String::new();
+                    while let Some(&ch) = self.chars.peek() {
+                        if ch == '"' {
+                            self.chars.next();
+                            break;
+                        }
+                        string_val.push(ch);
+                        self.chars.next();
+                    }
+                    return Token::StringLiteral(string_val);
                 }
                 '<' => {
                     self.chars.next();

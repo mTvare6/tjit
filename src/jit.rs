@@ -16,10 +16,20 @@ extern "C" fn print_i64(val: i64) -> i64 {
     0
 }
 
-// Helper to mimic C's `memcpy` for inline Value Semantics
+extern "C" fn print_str(fat_ptr_addr: i64) -> i64 {
+    let rodata_ptr = unsafe { *(fat_ptr_addr as *const i64) };
+    let len = unsafe { *((fat_ptr_addr + 8) as *const i64) };
+    let slice = unsafe { std::slice::from_raw_parts(rodata_ptr as *const u8, len as usize) };
+    let s = std::str::from_utf8(slice).unwrap();
+
+    println!("=> {}", s);
+    0
+}
+
+// mimic memcpy for inline value semantics
 fn emit_memory_copy(builder: &mut FunctionBuilder, src_ptr: Value, dest_ptr: Value, size: u32) {
-    // A production compiler links the OS `memcpy`, but for our JIT,
-    // unrolling an 8-byte chunk loop is blazing fast and perfectly fine.
+    // usually compilers links memcpy but
+    // unrolling 8b chunk loop is good enough
     let mut offset = 0;
     while offset < size {
         let chunk = builder
@@ -39,7 +49,7 @@ macro_rules! emit_binary_op {
             Type::I8 | Type::I16 | Type::I32 | Type::I64 => $builder.ins().$int_op($lhs, $rhs),
             Type::U8 | Type::U16 | Type::U32 | Type::U64 => $builder.ins().$uint_op($lhs, $rhs),
             Type::F32 | Type::F64 => $builder.ins().$float_op($lhs, $rhs),
-            Type::Custom(_) | Type::Array(..) | Type::Enum(..) => {
+            Type::Custom(_) | Type::Array(..) | Type::Enum(..) | Type::String => {
                 panic!("Fatal: Cannot perform arithmetic operations on non numeric type")
             }
         }
@@ -62,7 +72,7 @@ macro_rules! emit_cmp_op {
                 let b = $builder.ins().fcmp(FloatCC::$float_cc, $lhs, $rhs);
                 $builder.ins().uextend(types::I64, b)
             }
-            Type::Custom(_) | Type::Array(..) | Type::Enum(..) => {
+            Type::Custom(_) | Type::Array(..) | Type::Enum(..) | Type::String => {
                 panic!("Fatal: Cannot compare raw struct memory directly")
             }
         }
@@ -91,6 +101,7 @@ impl JITEngine {
         let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
 
         builder.symbol("print", print_i64 as *const u8);
+        builder.symbol("print_str", print_str as *const u8);
 
         let module = JITModule::new(builder);
 
@@ -245,7 +256,7 @@ impl JITEngine {
                 let (expected_tag, expected_payload_tys) =
                     layout.variants.get(variant_name).unwrap();
 
-                // 1. Check the Tag at offset 0
+                // check the tag at offset 0
                 let tag_val = builder.ins().load(types::I32, MemFlags::new(), ptr, 0);
                 let expected_tag_val = builder.ins().iconst(types::I32, *expected_tag as i64);
                 let is_match = builder.ins().icmp(IntCC::Equal, tag_val, expected_tag_val);
@@ -257,7 +268,7 @@ impl JITEngine {
                 builder.switch_to_block(success_block);
                 builder.seal_block(success_block);
 
-                // 2. Recursively check every nested payload!
+                // recursively check every nested payload
                 for (i, p) in payloads.iter().enumerate() {
                     let (_, offset) = expected_payload_tys[i];
                     let payload_ptr = builder.ins().iadd_imm(ptr, offset as i64);
@@ -352,7 +363,7 @@ impl JITEngine {
             }
         }
 
-        // ABI coercion, force the final value to match the `i64` return signature
+        // ABI coercion, force the final value to match the i64 return signature
         match final_type {
             Type::F32 | Type::F64 => {
                 // convert float to signed integer
@@ -407,6 +418,48 @@ impl JITEngine {
         enums: &HashMap<String, EnumLayout>,
     ) -> Option<Value> {
         match expr {
+            TypedExpr::StringLiteral(s) => {
+                let mut data_ctx = cranelift_module::DataDescription::new();
+                let bytes = s.clone().into_bytes();
+                let len = bytes.len() as i64;
+
+                // no null terminator(fat pointer)
+                data_ctx.define(bytes.into_boxed_slice());
+
+                // unique id for this string
+                static STR_ID: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                let id = STR_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+                let data_id = module
+                    .declare_data(
+                        &format!("str_{}", id),
+                        Linkage::Local,
+                        false, // read-only memory
+                        false,
+                    )
+                    .unwrap();
+
+                // define in binary and get the pointer to the text
+                module.define_data(data_id, &data_ctx).unwrap();
+                let local_id = module.declare_data_in_func(data_id, &mut builder.func);
+                let rodata_ptr = builder.ins().symbol_value(types::I64, local_id);
+                let len_val = builder.ins().iconst(types::I64, len);
+
+                // 16 bytes on the stack for (ptr, len) tuple
+                let slot_data = StackSlotData::new(StackSlotKind::ExplicitSlot, 16);
+                let slot = builder.create_sized_stack_slot(slot_data);
+                let fat_ptr_base = builder.ins().stack_addr(types::I64, slot, 0);
+
+                builder
+                    .ins()
+                    .store(MemFlags::new(), rodata_ptr, fat_ptr_base, 0);
+                builder
+                    .ins()
+                    .store(MemFlags::new(), len_val, fat_ptr_base, 8);
+
+                Some(fat_ptr_base)
+            }
             TypedExpr::Number(n, num_ty) => {
                 let cl_type = num_ty.into();
                 Some(builder.ins().iconst(cl_type, *n))
