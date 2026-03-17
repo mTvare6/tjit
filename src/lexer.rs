@@ -51,6 +51,7 @@ pub enum Token {
     Colon,
     DoubleColon,
     Arrow,
+    Pipe,
     FatArrow,
     DotDot,
     DotDotEqual,
@@ -247,6 +248,14 @@ impl<'a> Lexer<'a> {
                 '[' => {
                     self.chars.next();
                     return Token::LBracket;
+                }
+                '|' => {
+                    self.chars.next();
+                    if self.chars.peek() == Some(&'>') {
+                        self.chars.next();
+                        return Token::Pipe;
+                    }
+                    panic!("Expected '>' after '|' for pipeline operator");
                 }
                 _ => panic!("Unexpected character: {}", ch),
             }

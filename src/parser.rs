@@ -613,8 +613,34 @@ impl<'a> Parser<'a> {
                 Some(Expr::Continue)
             }
             Some(Token::LBrace) => self.parse_block(),
-            _ => self.parse_relational(),
+            _ => self.parse_pipeline(),
         }
+    }
+
+fn parse_pipeline(&mut self) -> Option<Expr> {
+        // between relational and expression
+        let mut left = self.parse_relational()?;
+
+        while self.peek() == Some(&Token::Pipe) {
+            self.next();
+
+            // should be a function call
+            let right = self.parse_relational()?;
+
+            left = match right {
+                Expr::Call(func_name, mut args) => {
+                    args.insert(0, left);
+                    Expr::Call(func_name, args)
+                }
+                Expr::Variable(func_name) => {
+                    // `2 |> print` instead of `2 |> print()`
+                    Expr::Call(func_name, vec![left])
+                }
+                _ => panic!("Expected a function call after '|>', found {:?}", right),
+            };
+        }
+
+        Some(left)
     }
 
     fn parse_match(&mut self) -> Option<Expr> {
