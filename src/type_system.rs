@@ -12,10 +12,21 @@ pub fn size_and_align_of(
     enums: &HashMap<String, EnumLayout>,
 ) -> (u32, u32) {
     match ty {
-        Type::I8 | Type::U8 => (1, 1),
-        Type::I16 | Type::U16 => (2, 2),
-        Type::I32 | Type::U32 | Type::F32 => (4, 4),
-        Type::I64 | Type::U64 | Type::F64 => (8, 8),
+        Type::Int(bits) | Type::UInt(bits) => {
+            let bytes = (bits + 7) / 8;
+            let align = if bytes <= 1 {
+                1
+            } else if bytes <= 2 {
+                2
+            } else if bytes <= 4 {
+                4
+            } else {
+                8
+            };
+            (bytes as u32, align as u32)
+        }
+        Type::F32 => (4, 4),
+        Type::F64 => (8, 8),
         Type::String => (16, 8),
         Type::Array(inner, len) => {
             let (elem_size, align) = size_and_align_of(inner, structs, enums);
@@ -81,10 +92,10 @@ impl TypedExpr {
             TypedExpr::Break(e) => e.ty(),
             TypedExpr::Float(_) => Type::F64,
             TypedExpr::EnumInit(name, _, _) => Type::Custom(name.clone()),
-            TypedExpr::Continue => Type::I64,
-            TypedExpr::FnDecl(..) => Type::I64,
-            TypedExpr::EnumDecl(..) => Type::I64,
-            TypedExpr::StructDecl(..) => Type::I64,
+            TypedExpr::Continue => Type::Int(64),
+            TypedExpr::FnDecl(..) => Type::Int(64),
+            TypedExpr::EnumDecl(..) => Type::Int(64),
+            TypedExpr::StructDecl(..) => Type::Int(64),
             TypedExpr::StructInit(name, _) => Type::Custom(name.clone()),
             TypedExpr::StringLiteral(_) => Type::String,
         }
@@ -93,33 +104,11 @@ impl TypedExpr {
 
 impl Type {
     pub fn is_integer_type(&self) -> bool {
-        matches!(
-            self,
-            Type::I64
-                | Type::I32
-                | Type::I16
-                | Type::I8
-                | Type::U64
-                | Type::U32
-                | Type::U16
-                | Type::U8
-        )
+        matches!(self, Type::Int(_) | Type::UInt(_))
     }
 
     pub fn is_primitive(&self) -> bool {
-        matches!(
-            self,
-            Type::I8
-                | Type::I16
-                | Type::I32
-                | Type::I64
-                | Type::U8
-                | Type::U16
-                | Type::U32
-                | Type::U64
-                | Type::F32
-                | Type::F64
-        )
+        matches!(self, Type::Int(_) | Type::UInt(_) | Type::F32 | Type::F64)
     }
 }
 
@@ -175,8 +164,11 @@ pub struct TypeChecker {
 impl TypeChecker {
     pub fn new() -> Self {
         let mut functions = HashMap::new();
-        functions.insert(String::from("print"), (vec![Type::I64], Type::I64));
-        functions.insert(String::from("print_str"), (vec![Type::String], Type::I64));
+        functions.insert(String::from("print"), (vec![Type::Int(64)], Type::Int(64)));
+        functions.insert(
+            String::from("print_str"),
+            (vec![Type::String], Type::Int(64)),
+        );
         Self {
             variables: HashMap::new(),
             functions,
@@ -425,8 +417,8 @@ impl TypeChecker {
 
     fn check_expr(&mut self, expr: &Expr) -> Result<TypedExpr, String> {
         match expr {
-Expr::StringLiteral(s) => Ok(TypedExpr::StringLiteral(s.clone())),
-            Expr::Number(n) => Ok(TypedExpr::Number(*n, Type::I64)), // default until coerced
+            Expr::StringLiteral(s) => Ok(TypedExpr::StringLiteral(s.clone())),
+            Expr::Number(n) => Ok(TypedExpr::Number(*n, Type::Int(64))), // default until coerced
             Expr::Float(f) => Ok(TypedExpr::Float(*f)),
             Expr::Variable(name) => {
                 let ty = self
@@ -523,7 +515,7 @@ Expr::StringLiteral(s) => Ok(TypedExpr::StringLiteral(s.clone())),
 
                 let resolved_type = match op {
                     Op::Add | Op::Subtract | Op::Multiply | Op::Divide => t_left.ty(),
-                    _ => Type::I64,
+                    _ => Type::Int(64),
                 };
 
                 Ok(TypedExpr::BinaryOp(
@@ -535,7 +527,7 @@ Expr::StringLiteral(s) => Ok(TypedExpr::StringLiteral(s.clone())),
             }
             Expr::If(cond, then_branch, else_branch) => {
                 let t_cond = self.check_expr(cond)?;
-                if t_cond.ty() != Type::I64 {
+                if t_cond.ty() != Type::Int(64) {
                     return Err(format!(
                         "Type Error: If condition must evaluate to I64, found {:?}",
                         t_cond.ty()
@@ -561,7 +553,7 @@ Expr::StringLiteral(s) => Ok(TypedExpr::StringLiteral(s.clone())),
             }
             Expr::Loop(body) => {
                 let previous_loop_type = self.loop_break_type.take();
-                self.loop_break_type = Some(Type::I64); // default assumption, overwritten by break
+                self.loop_break_type = Some(Type::Int(64)); // default assumption, overwritten by break
 
                 let t_body = self.check_expr(body)?;
 
@@ -593,7 +585,7 @@ Expr::StringLiteral(s) => Ok(TypedExpr::StringLiteral(s.clone())),
             }
             Expr::Block(exprs) => {
                 let mut t_exprs = Vec::new();
-                let mut last_type = Type::I64;
+                let mut last_type = Type::Int(64);
                 for e in exprs {
                     let t_e = self.check_expr(e)?;
                     last_type = t_e.ty();
@@ -768,7 +760,7 @@ Expr::StringLiteral(s) => Ok(TypedExpr::StringLiteral(s.clone())),
                 let mut t_index = self.check_expr(index_expr)?;
 
                 if let TypedExpr::Number(n, _) = &mut t_index {
-                    t_index = TypedExpr::Number(*n, Type::I64);
+                    t_index = TypedExpr::Number(*n, Type::Int(64));
                 }
 
                 if !t_index.ty().is_integer_type() {
@@ -893,7 +885,7 @@ Expr::StringLiteral(s) => Ok(TypedExpr::StringLiteral(s.clone())),
                 Ok(TypedExpr::Match(
                     Box::new(t_target),
                     t_arms,
-                    return_ty.unwrap_or(Type::I64),
+                    return_ty.unwrap_or(Type::Int(64)),
                 ))
             }
         }

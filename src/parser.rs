@@ -29,14 +29,8 @@ pub enum Expr {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Type {
-    I8,
-    I16,
-    I32,
-    I64,
-    U8,
-    U16,
-    U32,
-    U64,
+    Int(u16),  // eg: i7, i32, i128
+    UInt(u16), // eg: u1, u17, u64
     F32,
     F64,
     Custom(String),
@@ -48,10 +42,9 @@ pub enum Type {
 impl Into<types::Type> for &Type {
     fn into(self) -> types::Type {
         match self {
-            Type::I8 | Type::U8 => types::I8,
-            Type::I16 | Type::U16 => types::I16,
-            Type::I32 | Type::U32 => types::I32,
-            Type::I64 | Type::U64 => types::I64,
+            Type::Int(bits) | Type::UInt(bits) => {
+                types::Type::int(*bits).expect("Invalid bit width")
+            }
             Type::F32 => types::F32,
             Type::F64 => types::F64,
             Type::Custom(..) => types::I64,
@@ -395,19 +388,20 @@ impl<'a> Parser<'a> {
             return Type::Array(Box::new(inner_ty), size);
         }
         if let Some(Token::Identifier(type_name)) = self.peek() {
-            let ty = match type_name.as_str() {
-                "i8" => Type::I8,
-                "i16" => Type::I16,
-                "i32" => Type::I32,
-                "i64" => Type::I64,
-                "u8" => Type::U8,
-                "u16" => Type::U16,
-                "u32" => Type::U32,
-                "u64" => Type::U64,
-                "f32" => Type::F32,
-                "f64" => Type::F64,
-                "String" => Type::String,
-                _ => Type::Custom(type_name.clone()),
+            let ty = if type_name == "f32" {
+                Type::F32
+            } else if type_name == "f64" {
+                Type::F64
+            } else if type_name.starts_with('i')
+                && type_name[1..].chars().all(|c| c.is_ascii_digit())
+            {
+                Type::Int(type_name[1..].parse().unwrap())
+            } else if type_name.starts_with('u')
+                && type_name[1..].chars().all(|c| c.is_ascii_digit())
+            {
+                Type::UInt(type_name[1..].parse().unwrap())
+            } else {
+                Type::Custom(type_name.clone())
             };
             self.next();
             ty
@@ -617,7 +611,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-fn parse_pipeline(&mut self) -> Option<Expr> {
+    fn parse_pipeline(&mut self) -> Option<Expr> {
         // between relational and expression
         let mut left = self.parse_relational()?;
 

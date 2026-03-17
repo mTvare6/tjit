@@ -28,8 +28,7 @@ extern "C" fn print_str(fat_ptr_addr: i64) -> i64 {
 
 // mimic memcpy for inline value semantics
 fn emit_memory_copy(builder: &mut FunctionBuilder, src_ptr: Value, dest_ptr: Value, size: u32) {
-    // usually compilers links memcpy but
-    // unrolling 8b chunk loop is good enough
+    // usually compilers links memcpy but unrolling 8b chunk loop is good enough
     let mut offset = 0;
     while offset < size {
         let chunk = builder
@@ -46,8 +45,8 @@ fn emit_memory_copy(builder: &mut FunctionBuilder, src_ptr: Value, dest_ptr: Val
 macro_rules! emit_binary_op {
     ($builder:expr, $ty:expr, $lhs:expr, $rhs:expr, $int_op:ident, $uint_op:ident, $float_op:ident) => {
         match $ty {
-            Type::I8 | Type::I16 | Type::I32 | Type::I64 => $builder.ins().$int_op($lhs, $rhs),
-            Type::U8 | Type::U16 | Type::U32 | Type::U64 => $builder.ins().$uint_op($lhs, $rhs),
+            Type::Int(_) => $builder.ins().$int_op($lhs, $rhs),
+            Type::UInt(_) => $builder.ins().$uint_op($lhs, $rhs),
             Type::F32 | Type::F64 => $builder.ins().$float_op($lhs, $rhs),
             Type::Custom(_) | Type::Array(..) | Type::Enum(..) | Type::String => {
                 panic!("Fatal: Cannot perform arithmetic operations on non numeric type")
@@ -60,11 +59,11 @@ macro_rules! emit_binary_op {
 macro_rules! emit_cmp_op {
     ($builder:expr, $ty:expr, $lhs:expr, $rhs:expr, $int_cc:ident, $uint_cc:ident, $float_cc:ident) => {
         match $ty {
-            Type::I8 | Type::I16 | Type::I32 | Type::I64 => {
+            Type::Int(_) => {
                 let b = $builder.ins().icmp(IntCC::$int_cc, $lhs, $rhs);
                 $builder.ins().uextend(types::I64, b)
             }
-            Type::U8 | Type::U16 | Type::U32 | Type::U64 => {
+            Type::UInt(_) => {
                 let b = $builder.ins().icmp(IntCC::$uint_cc, $lhs, $rhs);
                 $builder.ins().uextend(types::I64, b)
             }
@@ -341,7 +340,7 @@ impl JITEngine {
 
         // default return value
         let mut return_val = builder.ins().iconst(types::I64, 0);
-        let mut final_type = Type::I64;
+        let mut final_type = Type::Int(64);
 
         for expr in program {
             // bypass function declarations during the local pass
@@ -366,18 +365,23 @@ impl JITEngine {
         // ABI coercion, force the final value to match the i64 return signature
         match final_type {
             Type::F32 | Type::F64 => {
-                // convert float to signed integer
                 return_val = builder.ins().fcvt_to_sint(types::I64, return_val);
             }
-            Type::I8 | Type::I16 | Type::I32 => {
-                // sign-extend smaller integers to 64-bit
-                return_val = builder.ins().sextend(types::I64, return_val);
+            Type::Int(bits) => {
+                if bits < 64 {
+                    return_val = builder.ins().sextend(types::I64, return_val);
+                } else if bits > 64 {
+                    return_val = builder.ins().ireduce(types::I64, return_val);
+                }
             }
-            Type::U8 | Type::U16 | Type::U32 => {
-                // zero-extend unsigned integers to 64-bit
-                return_val = builder.ins().uextend(types::I64, return_val);
+            Type::UInt(bits) => {
+                if bits < 64 {
+                    return_val = builder.ins().uextend(types::I64, return_val);
+                } else if bits > 64 {
+                    return_val = builder.ins().ireduce(types::I64, return_val);
+                }
             }
-            _ => {} // I64 and U64 require no width coercion
+            _ => {} // arrays, structs, enums don't get returned
         }
 
         // emit the return instruction (the `}` of the function)
@@ -864,11 +868,19 @@ impl JITEngine {
 
                 // if passed an i8 or i32 as the index, expand to i64
                 match index_expr.ty() {
-                    Type::I8 | Type::I16 | Type::I32 => {
-                        index_val = builder.ins().sextend(types::I64, index_val);
+                    Type::Int(bits) => {
+                        if bits < 64 {
+                            index_val = builder.ins().sextend(types::I64, index_val);
+                        } else if bits > 64 {
+                            index_val = builder.ins().ireduce(types::I64, index_val);
+                        }
                     }
-                    Type::U8 | Type::U16 | Type::U32 => {
-                        index_val = builder.ins().uextend(types::I64, index_val);
+                    Type::UInt(bits) => {
+                        if bits < 64 {
+                            index_val = builder.ins().uextend(types::I64, index_val);
+                        } else if bits > 64 {
+                            index_val = builder.ins().ireduce(types::I64, index_val);
+                        }
                     }
                     _ => {}
                 }
