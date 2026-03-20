@@ -25,6 +25,7 @@ pub enum Expr {
     EnumInit(String, String, Vec<Expr>),
     Match(Box<Expr>, Vec<(Pat, Box<Expr>)>),
     StringLiteral(String),
+    Cast(Box<Expr>, Type),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -42,9 +43,7 @@ pub enum Type {
 impl Into<types::Type> for &Type {
     fn into(self) -> types::Type {
         match self {
-            Type::Int(bits) | Type::UInt(bits) => {
-                types::Type::int(*bits).expect("Invalid bit width")
-            }
+            Type::Int(_) | Type::UInt(_) => types::I64, // load into the ram as i64 always
             Type::F32 => types::F32,
             Type::F64 => types::F64,
             Type::Custom(..) => types::I64,
@@ -346,7 +345,11 @@ impl<'a> Parser<'a> {
 
         // handle chained postfix operations, a.b.c or arr[0][1]
         loop {
-            if self.peek() == Some(&Token::Dot) {
+            if self.peek() == Some(&Token::As) {
+                self.next();
+                let target_ty = self.parse_type();
+                expr = Expr::Cast(Box::new(expr), target_ty);
+            } else if self.peek() == Some(&Token::Dot) {
                 self.next();
                 let field_name = match self.next() {
                     Some(Token::Identifier(name)) => name.clone(),

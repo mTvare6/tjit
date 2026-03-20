@@ -1,6 +1,6 @@
 use crate::parser::{Op, Type};
 use crate::type_system::{
-    EnumLayout, StructLayout, TypedExpr, TypedPat, align_to, size_and_align_of,
+    EnumLayout, StructLayout, TypedExpr, TypedPat, align_to, bit_size_of, size_and_align_of,
 };
 use cranelift::prelude::*;
 use cranelift_jit::{JITBuilder, JITModule};
@@ -255,7 +255,6 @@ impl JITEngine {
                 let (expected_tag, expected_payload_tys) =
                     layout.variants.get(variant_name).unwrap();
 
-                // check the tag at offset 0
                 let tag_val = builder.ins().load(types::I32, MemFlags::new(), ptr, 0);
                 let expected_tag_val = builder.ins().iconst(types::I32, *expected_tag as i64);
                 let is_match = builder.ins().icmp(IntCC::Equal, tag_val, expected_tag_val);
@@ -267,40 +266,135 @@ impl JITEngine {
                 builder.switch_to_block(success_block);
                 builder.seal_block(success_block);
 
-                // recursively check every nested payload
                 for (i, p) in payloads.iter().enumerate() {
-                    let (_, offset) = expected_payload_tys[i];
-                    let payload_ptr = builder.ins().iadd_imm(ptr, offset as i64);
-                    Self::emit_pattern_match(
-                        builder,
-                        p,
-                        payload_ptr,
-                        fail_block,
-                        variables,
-                        variable_index,
-                        structs,
-                        enums,
-                    );
+                    let (expected_ty, bit_offset) = &expected_payload_tys[i];
+                    let bits = crate::type_system::bit_size_of(expected_ty);
+                    let word_offset = (*bit_offset / 64) * 8;
+                    let shift = *bit_offset % 64;
+
+                    let extracted_val = if expected_ty.is_integer_type() && bits < 64 {
+                        let chunk = builder.ins().load(
+                            types::I64,
+                            MemFlags::new(),
+                            ptr,
+                            word_offset as i32,
+                        );
+                        let shifted = builder.ins().ushr_imm(chunk, shift as i64);
+                        let raw_mask = 1u64.checked_shl(bits).unwrap_or(0).wrapping_sub(1);
+                        let mask_val = builder.ins().iconst(types::I64, raw_mask as i64);
+                        let mut isolated = builder.ins().band(shifted, mask_val);
+
+                        if let Type::Int(_) = expected_ty {
+                            let shift_up = 64 - bits;
+                            isolated = builder.ins().ishl_imm(isolated, shift_up as i64);
+                            isolated = builder.ins().sshr_imm(isolated, shift_up as i64);
+                        }
+                        isolated
+                    } else {
+                        let cl_type = expected_ty.into();
+                        builder
+                            .ins()
+                            .load(cl_type, MemFlags::new(), ptr, word_offset as i32)
+                    };
+
+                    // Allocate temp slot for the nested pattern to inspect
+                    let temp_slot_data = StackSlotData::new(StackSlotKind::ExplicitSlot, 8);
+                    let temp_slot = builder.create_sized_stack_slot(temp_slot_data);
+                    let temp_ptr = builder.ins().stack_addr(types::I64, temp_slot, 0);
+
+                    if expected_ty.is_primitive() {
+                        builder
+                            .ins()
+                            .store(MemFlags::new(), extracted_val, temp_ptr, 0);
+                        Self::emit_pattern_match(
+                            builder,
+                            p,
+                            temp_ptr,
+                            fail_block,
+                            variables,
+                            variable_index,
+                            structs,
+                            enums,
+                        );
+                    } else {
+                        Self::emit_pattern_match(
+                            builder,
+                            p,
+                            extracted_val,
+                            fail_block,
+                            variables,
+                            variable_index,
+                            structs,
+                            enums,
+                        );
+                    }
                 }
             }
 
             TypedPat::Struct(struct_name, fields, _) => {
                 let layout = structs.get(struct_name).unwrap();
 
-                // Structs don't have tags, we just recursively check the inner fields
                 for (f_name, f_pat) in fields {
-                    let (_, offset) = layout.fields.get(f_name).unwrap();
-                    let field_ptr = builder.ins().iadd_imm(ptr, *offset as i64);
-                    Self::emit_pattern_match(
-                        builder,
-                        f_pat,
-                        field_ptr,
-                        fail_block,
-                        variables,
-                        variable_index,
-                        structs,
-                        enums,
-                    );
+                    let (expected_ty, bit_offset) = layout.fields.get(f_name).unwrap();
+                    let bits = crate::type_system::bit_size_of(expected_ty);
+                    let word_offset = (*bit_offset / 64) * 8;
+                    let shift = *bit_offset % 64;
+
+                    let extracted_val = if expected_ty.is_integer_type() && bits < 64 {
+                        let chunk = builder.ins().load(
+                            types::I64,
+                            MemFlags::new(),
+                            ptr,
+                            word_offset as i32,
+                        );
+                        let shifted = builder.ins().ushr_imm(chunk, shift as i64);
+                        let raw_mask = 1u64.checked_shl(bits).unwrap_or(0).wrapping_sub(1);
+                        let mask_val = builder.ins().iconst(types::I64, raw_mask as i64);
+                        let mut isolated = builder.ins().band(shifted, mask_val);
+
+                        if let Type::Int(_) = expected_ty {
+                            let shift_up = 64 - bits;
+                            isolated = builder.ins().ishl_imm(isolated, shift_up as i64);
+                            isolated = builder.ins().sshr_imm(isolated, shift_up as i64);
+                        }
+                        isolated
+                    } else {
+                        let cl_type = expected_ty.into();
+                        builder
+                            .ins()
+                            .load(cl_type, MemFlags::new(), ptr, word_offset as i32)
+                    };
+
+                    let temp_slot_data = StackSlotData::new(StackSlotKind::ExplicitSlot, 8);
+                    let temp_slot = builder.create_sized_stack_slot(temp_slot_data);
+                    let temp_ptr = builder.ins().stack_addr(types::I64, temp_slot, 0);
+
+                    if expected_ty.is_primitive() {
+                        builder
+                            .ins()
+                            .store(MemFlags::new(), extracted_val, temp_ptr, 0);
+                        Self::emit_pattern_match(
+                            builder,
+                            f_pat,
+                            temp_ptr,
+                            fail_block,
+                            variables,
+                            variable_index,
+                            structs,
+                            enums,
+                        );
+                    } else {
+                        Self::emit_pattern_match(
+                            builder,
+                            f_pat,
+                            extracted_val,
+                            fail_block,
+                            variables,
+                            variable_index,
+                            structs,
+                            enums,
+                        );
+                    }
                 }
             }
         }
@@ -368,18 +462,14 @@ impl JITEngine {
                 return_val = builder.ins().fcvt_to_sint(types::I64, return_val);
             }
             Type::Int(bits) => {
-                if bits < 64 {
-                    return_val = builder.ins().sextend(types::I64, return_val);
-                } else if bits > 64 {
-                    return_val = builder.ins().ireduce(types::I64, return_val);
-                }
+                let shift_up = 64 - bits;
+                return_val = builder.ins().ishl_imm(return_val, shift_up as i64);
+                return_val = builder.ins().sshr_imm(return_val, shift_up as i64);
             }
             Type::UInt(bits) => {
-                if bits < 64 {
-                    return_val = builder.ins().uextend(types::I64, return_val);
-                } else if bits > 64 {
-                    return_val = builder.ins().ireduce(types::I64, return_val);
-                }
+                let mask = 1u64.checked_shl(bits as u32).unwrap_or(0).wrapping_sub(1);
+                let mask_val = builder.ins().iconst(types::I64, mask as i64);
+                return_val = builder.ins().band(return_val, mask_val);
             }
             _ => {} // arrays, structs, enums don't get returned
         }
@@ -763,14 +853,11 @@ impl JITEngine {
             TypedExpr::StructInit(name, fields) => {
                 let layout = structs.get(name).unwrap();
 
-                // allocate a contiguous block on the call stack
-                let slot_data = StackSlotData::new(StackSlotKind::ExplicitSlot, layout.size);
+                // allocate struct based on calculated bytes
+                let slot_data = StackSlotData::new(StackSlotKind::ExplicitSlot, layout.size_bytes);
                 let slot = builder.create_sized_stack_slot(slot_data);
-
-                // get physical memory pointer to the start of the struct
                 let base_ptr = builder.ins().stack_addr(types::I64, slot, 0);
 
-                // store at the correct byte offset
                 for (f_name, f_expr) in fields {
                     let val = Self::compile_expr(
                         f_expr,
@@ -782,11 +869,39 @@ impl JITEngine {
                         structs,
                         enums,
                     )?;
-                    let (_, offset) = layout.fields.get(f_name).unwrap();
 
-                    builder.ins().store(MemFlags::new(), val, base_ptr, *offset);
+                    let (expected_ty, bit_offset) = layout.fields.get(f_name).unwrap();
+                    let bits = bit_size_of(expected_ty);
+
+                    let word_offset = (*bit_offset / 64) * 8;
+                    let shift = *bit_offset % 64;
+
+                    if expected_ty.is_integer_type() && bits < 64 {
+                        let chunk = builder.ins().load(
+                            types::I64,
+                            MemFlags::new(),
+                            base_ptr,
+                            word_offset as i32,
+                        );
+
+                        let raw_mask = 1u64.checked_shl(bits).unwrap_or(0).wrapping_sub(1);
+                        let inverted_mask = !(raw_mask << shift);
+                        let mask_val = builder.ins().iconst(types::I64, inverted_mask as i64);
+
+                        let cleared = builder.ins().band(chunk, mask_val);
+
+                        let shifted_val = builder.ins().ishl_imm(val, shift as i64);
+                        let merged = builder.ins().bor(cleared, shifted_val);
+
+                        builder
+                            .ins()
+                            .store(MemFlags::new(), merged, base_ptr, word_offset as i32);
+                    } else {
+                        builder
+                            .ins()
+                            .store(MemFlags::new(), val, base_ptr, word_offset as i32);
+                    }
                 }
-
                 Some(base_ptr)
             }
             TypedExpr::FieldAccess(base, f_name, f_ty) => {
@@ -807,15 +922,42 @@ impl JITEngine {
                 };
 
                 let layout = structs.get(&struct_name).unwrap();
-                let (_, offset) = layout.fields.get(f_name).unwrap();
+                let (_, bit_offset) = layout.fields.get(f_name).unwrap();
 
-                // load directly from base_pointer + byte_offset
-                let cl_type = f_ty.into();
-                let val = builder
-                    .ins()
-                    .load(cl_type, MemFlags::new(), base_ptr, *offset);
+                let word_offset = (*bit_offset / 64) * 8;
+                let shift = *bit_offset % 64;
+                let bits = bit_size_of(f_ty);
 
-                Some(val)
+                let extracted_val = if f_ty.is_integer_type() && bits < 64 {
+                    // load the 64-bit chunk and shift the target bits down to zero
+                    let chunk = builder.ins().load(
+                        types::I64,
+                        MemFlags::new(),
+                        base_ptr,
+                        word_offset as i32,
+                    );
+                    let shifted = builder.ins().ushr_imm(chunk, shift as i64);
+
+                    // mask off the upper garbage bits
+                    let raw_mask = 1u64.checked_shl(bits).unwrap_or(0).wrapping_sub(1);
+                    let mask_val = builder.ins().iconst(types::I64, raw_mask as i64);
+                    let mut isolated = builder.ins().band(shifted, mask_val);
+
+                    // sign-extend if it's a signed integer
+                    if let Type::Int(_) = f_ty {
+                        let shift_up = 64 - bits;
+                        isolated = builder.ins().ishl_imm(isolated, shift_up as i64);
+                        isolated = builder.ins().sshr_imm(isolated, shift_up as i64);
+                    }
+                    isolated
+                } else {
+                    let cl_type = f_ty.into();
+                    builder
+                        .ins()
+                        .load(cl_type, MemFlags::new(), base_ptr, word_offset as i32)
+                };
+
+                Some(extracted_val)
             }
             TypedExpr::ArrayInit(elements, _array_ty) => {
                 let inner_ty = elements[0].ty();
@@ -900,7 +1042,7 @@ impl JITEngine {
                 let layout = enums.get(enum_name).unwrap();
                 let (tag, field_layouts) = layout.variants.get(variant_name).unwrap();
 
-                let slot_data = StackSlotData::new(StackSlotKind::ExplicitSlot, layout.size);
+                let slot_data = StackSlotData::new(StackSlotKind::ExplicitSlot, layout.size_bytes);
                 let slot = builder.create_sized_stack_slot(slot_data);
                 let base_ptr = builder.ins().stack_addr(types::I64, slot, 0);
 
@@ -918,16 +1060,36 @@ impl JITEngine {
                         structs,
                         enums,
                     )?;
+                    let (expected_ty, bit_offset) = &field_layouts[i];
+                    let bits = crate::type_system::bit_size_of(expected_ty);
 
-                    let (expected_ty, offset) = &field_layouts[i];
+                    let word_offset = (*bit_offset / 64) * 8; // byte offset
+                    let shift = *bit_offset % 64;
 
-                    if expected_ty.is_primitive() {
+                    if expected_ty.is_integer_type() && bits < 64 {
+                        let chunk = builder.ins().load(
+                            types::I64,
+                            MemFlags::new(),
+                            base_ptr,
+                            word_offset as i32,
+                        );
+                        let raw_mask = 1u64.checked_shl(bits).unwrap_or(0).wrapping_sub(1);
+                        let inverted_mask = !(raw_mask << shift);
+                        let mask_val = builder.ins().iconst(types::I64, inverted_mask as i64);
+
+                        let cleared = builder.ins().band(chunk, mask_val);
+                        let shifted_val = builder.ins().ishl_imm(p_val, shift as i64);
+                        let merged = builder.ins().bor(cleared, shifted_val);
                         builder
                             .ins()
-                            .store(MemFlags::new(), p_val, base_ptr, *offset);
+                            .store(MemFlags::new(), merged, base_ptr, word_offset as i32);
+                    } else if expected_ty.is_primitive() {
+                        builder
+                            .ins()
+                            .store(MemFlags::new(), p_val, base_ptr, word_offset as i32);
                     } else {
                         let (p_size, _) = size_and_align_of(expected_ty, structs, enums);
-                        let dest_ptr = builder.ins().iadd_imm(base_ptr, *offset as i64);
+                        let dest_ptr = builder.ins().iadd_imm(base_ptr, word_offset as i64);
                         emit_memory_copy(builder, p_val, dest_ptr, p_size);
                     }
                 }
@@ -1013,6 +1175,55 @@ impl JITEngine {
                 builder.seal_block(merge_block);
 
                 Some(builder.block_params(merge_block)[0])
+            }
+            TypedExpr::Cast(expr, target_ty) => {
+                let val = Self::compile_expr(
+                    expr,
+                    module,
+                    builder,
+                    variables,
+                    variable_index,
+                    loop_stack,
+                    structs,
+                    enums,
+                )?;
+
+                let src_ty = expr.ty();
+
+                Some(match (src_ty, target_ty) {
+                    // Integer to Integer (Sign Extension)
+                    (Type::Int(_), Type::Int(d)) | (Type::UInt(_), Type::Int(d)) => {
+                        let shift_up = 64 - d;
+                        let shifted = builder.ins().ishl_imm(val, shift_up as i64);
+                        builder.ins().sshr_imm(shifted, shift_up as i64)
+                    }
+                    // Integer to Unsigned (Bitwise Truncation/Masking)
+                    (Type::Int(_), Type::UInt(d)) | (Type::UInt(_), Type::UInt(d)) => {
+                        let raw_mask = 1u64.checked_shl(*d as u32).unwrap_or(0).wrapping_sub(1);
+                        let mask_val = builder.ins().iconst(types::I64, raw_mask as i64);
+                        builder.ins().band(val, mask_val)
+                    }
+
+                    // Float to Integer (Truncates decimals)
+                    (Type::F32 | Type::F64, Type::Int(_)) => {
+                        builder.ins().fcvt_to_sint(types::I64, val)
+                    }
+                    (Type::F32 | Type::F64, Type::UInt(_)) => {
+                        builder.ins().fcvt_to_uint(types::I64, val)
+                    }
+
+                    // Integer to Float (Adds decimal precision)
+                    (Type::Int(_), Type::F32) => builder.ins().fcvt_from_sint(types::F32, val),
+                    (Type::Int(_), Type::F64) => builder.ins().fcvt_from_sint(types::F64, val),
+                    (Type::UInt(_), Type::F32) => builder.ins().fcvt_from_uint(types::F32, val),
+                    (Type::UInt(_), Type::F64) => builder.ins().fcvt_from_uint(types::F64, val),
+
+                    // Float to Float (Promote or Demote)
+                    (Type::F32, Type::F64) => builder.ins().fpromote(types::F64, val),
+                    (Type::F64, Type::F32) => builder.ins().fdemote(types::F32, val),
+
+                    _ => val, // Fallback (No-Op)
+                })
             }
         }
     }

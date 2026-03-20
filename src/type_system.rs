@@ -2,6 +2,28 @@ use crate::parser::Pat;
 use crate::parser::{Expr, Op, Type};
 use std::collections::HashMap;
 
+#[derive(Clone)]
+pub struct StructLayout {
+    pub size_bytes: u32,
+    pub fields: HashMap<String, (Type, u32)>, // (Type, Bit Offset)
+}
+
+#[derive(Clone)]
+pub struct EnumLayout {
+    pub size_bytes: u32,
+    pub variants: HashMap<String, (u32, Vec<(Type, u32)>)>, // (Tag, [(Type, Bit Offset)])
+}
+
+pub fn bit_size_of(ty: &Type) -> u32 {
+    match ty {
+        Type::Int(bits) | Type::UInt(bits) => *bits as u32,
+        Type::F32 => 32,
+        Type::F64 => 64,
+        Type::String => 128, // 16-byte Fat Pointer = 128 bits
+        Type::Array(..) | Type::Custom(..) | Type::Enum(..) => 64, // Pointers are 64 bits
+    }
+}
+
 pub fn align_to(offset: u32, align: u32) -> u32 {
     (offset + align - 1) & !(align - 1)
 }
@@ -35,9 +57,9 @@ pub fn size_and_align_of(
         }
         Type::Custom(name) | Type::Enum(name) => {
             if let Some(l) = structs.get(name) {
-                (l.size, l.align)
+                (l.size_bytes, 8)
             } else if let Some(l) = enums.get(name) {
-                (l.size, l.align)
+                (l.size_bytes, 8)
             } else {
                 panic!("Fatal: Type '{}' not resolved during layout phase", name);
             }
@@ -71,6 +93,7 @@ pub enum TypedExpr {
     EnumInit(String, String, Vec<TypedExpr>),
     Match(Box<TypedExpr>, Vec<(TypedPat, Box<TypedExpr>)>, Type),
     StringLiteral(String),
+    Cast(Box<TypedExpr>, Type),
 }
 
 impl TypedExpr {
@@ -88,6 +111,7 @@ impl TypedExpr {
             | TypedExpr::ArrayInit(_, t)
             | TypedExpr::Index(_, _, t)
             | TypedExpr::Match(_, _, t)
+            | TypedExpr::Cast(_, t)
             | TypedExpr::Call(_, _, t) => t.clone(),
             TypedExpr::Break(e) => e.ty(),
             TypedExpr::Float(_) => Type::F64,
@@ -135,20 +159,6 @@ impl TypedPat {
             | TypedPat::Enum(_, _, _, t) => t.clone(),
         }
     }
-}
-
-#[derive(Clone)]
-pub struct StructLayout {
-    pub size: u32,
-    pub align: u32,
-    pub fields: HashMap<String, (Type, i32)>, // maps field name to its (type, byte_offset)
-}
-
-#[derive(Clone)]
-pub struct EnumLayout {
-    pub size: u32,
-    pub align: u32,
-    pub variants: HashMap<String, (u32, Vec<(Type, i32)>)>, // maps variant name to (integer tag, payload types + offsets)
 }
 
 pub struct TypeChecker {
@@ -339,74 +349,67 @@ impl TypeChecker {
 
         if let Some(fields) = self.pending_structs.clone().get(name) {
             let mut layout = HashMap::new();
-            let mut offset = 0;
-            let mut max_align = 1;
+            let mut current_bit = 0u32;
 
             for (f_name, f_ty) in fields {
                 if let Type::Custom(c_name) = f_ty {
                     self.resolve_layout(c_name);
-                } // Recursion!
-
-                let (f_size, f_align) = size_and_align_of(f_ty, &self.structs, &self.enums);
-                offset = align_to(offset, f_align);
-                layout.insert(f_name.clone(), (f_ty.clone(), offset as i32));
-                offset += f_size;
-                if f_align > max_align {
-                    max_align = f_align;
                 }
+
+                let bits = bit_size_of(&f_ty);
+
+                // Rule: Don't let a field cross a 64-bit hardware boundary
+                if current_bit % 64 + bits > 64 {
+                    current_bit = (current_bit + 63) & !63; // Snap to next 64-bit boundary
+                }
+
+                layout.insert(f_name.clone(), (f_ty.clone(), current_bit));
+                current_bit += bits;
             }
 
-            let size = align_to(offset, max_align);
+            let size_bytes = ((current_bit + 63) & !63) / 8;
             self.structs.insert(
                 name.to_string(),
                 StructLayout {
-                    size,
-                    align: max_align,
+                    size_bytes,
                     fields: layout,
                 },
             );
         } else if let Some(variants) = self.pending_enums.clone().get(name) {
             let mut layout = HashMap::new();
-            let mut max_size = 4; // at minimum, 4 bytes for the i32 tag
-            let mut max_align = 4;
-            let mut tag_counter = 0;
+            let mut max_bits = 32u32; // Tag takes the first 32 bits
+            let mut tag_counter = 0u32;
 
             for (v_name, v_tys) in variants {
-                let mut payload_offset = 4; // tag lives at byte 0
-                let mut variant_align = 4;
+                let mut current_bit = 32u32; // Payloads start after the tag
                 let mut field_layouts = Vec::new();
 
                 for f_ty in v_tys {
                     if let Type::Custom(c_name) = f_ty {
                         self.resolve_layout(c_name);
-                    } // recursion
-
-                    let (f_size, f_align) = size_and_align_of(f_ty, &self.structs, &self.enums);
-                    payload_offset = align_to(payload_offset, f_align);
-                    field_layouts.push((f_ty.clone(), payload_offset as i32));
-                    payload_offset += f_size;
-                    if f_align > variant_align {
-                        variant_align = f_align;
                     }
+
+                    let bits = bit_size_of(&f_ty);
+                    if current_bit % 64 + bits > 64 {
+                        current_bit = (current_bit + 63) & !63;
+                    }
+
+                    field_layouts.push((f_ty.clone(), current_bit));
+                    current_bit += bits;
                 }
 
-                if payload_offset > max_size {
-                    max_size = payload_offset;
+                if current_bit > max_bits {
+                    max_bits = current_bit;
                 }
-                if variant_align > max_align {
-                    max_align = variant_align;
-                }
-
                 layout.insert(v_name.clone(), (tag_counter, field_layouts));
                 tag_counter += 1;
             }
 
-            let size = align_to(max_size, max_align);
+            let size_bytes = ((max_bits + 63) & !63) / 8;
             self.enums.insert(
                 name.to_string(),
                 EnumLayout {
-                    size,
-                    align: max_align,
+                    size_bytes,
                     variants: layout,
                 },
             );
@@ -620,7 +623,12 @@ impl TypeChecker {
                     }
 
                     if t_arg.ty() != *expected_type {
-                        return Err(format!("Type Error: Argument mismatch in '{}'", name));
+                        return Err(format!(
+                            "Type Error: Argument mismatch in '{}'. Expected {:?}, got {:?}",
+                            name,
+                            expected_type,
+                            t_arg.ty()
+                        ));
                     }
                     t_args.push(t_arg);
                 }
@@ -887,6 +895,20 @@ impl TypeChecker {
                     t_arms,
                     return_ty.unwrap_or(Type::Int(64)),
                 ))
+            }
+            Expr::Cast(inner_expr, target_ty) => {
+                let t_inner = self.check_expr(inner_expr)?;
+
+                // only allow casting between primitives
+                if !t_inner.ty().is_primitive() || !target_ty.is_primitive() {
+                    return Err(format!(
+                        "Type Error: Invalid explicit cast from {:?} to {:?}",
+                        t_inner.ty(),
+                        target_ty
+                    ));
+                }
+
+                Ok(TypedExpr::Cast(Box::new(t_inner), target_ty.clone()))
             }
         }
     }

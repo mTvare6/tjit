@@ -25,6 +25,7 @@ pub enum Token {
     Break,
     Continue,
     Fn,
+    As,
     Struct,
     Enum,
     Match,
@@ -115,6 +116,7 @@ impl<'a> Lexer<'a> {
         match ident.as_str() {
             "let" => Token::Let,
             "if" => Token::If,
+            "as" => Token::As,
             "else" => Token::Else,
             "continue" => Token::Continue,
             "break" => Token::Break,
