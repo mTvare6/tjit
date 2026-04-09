@@ -1,0 +1,9 @@
+fn test_array() -> i64 {
+  let arr: [i64; 4] = [10, 20, 30, 40]
+  let index = 2
+  let val = arr[index]
+  print(val)
+  val
+}
+
+test_array()

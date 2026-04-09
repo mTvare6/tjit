@@ -34,7 +34,7 @@ fn main() {
     match jit.compile(&typed_ast, &typechecker.structs, &typechecker.enums) {
         Ok(jit_fn) => {
             let result = jit_fn();
-            println!("{}", result);
+            std::process::exit(result as i32)
         }
         Err(e) => println!("Compilation failed: {}", e),
     }

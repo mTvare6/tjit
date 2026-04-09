@@ -1,0 +1,13 @@
+enum MyOption { None, Some(i64) }
+
+fn test_match() -> i64 {
+    let x: MyOption = MyOption::Some(99);
+    let result = match x {
+        MyOption::None => 0,
+        MyOption::Some(val) => val
+    };
+    print(result);
+    result
+}
+
+test_match()

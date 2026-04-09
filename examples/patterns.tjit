@@ -1,0 +1,45 @@
+struct Point {
+    x: i64,
+    y: i64
+}
+
+enum Event {
+    Click(Point),
+    KeyPress(i64),
+    Quit
+}
+
+fn run_tests() -> i64 {
+    let val = 15;
+    let r1 = match val {
+        0..10 => 0,
+        10..=20 => 1,
+        _ => 2
+    };
+    print(r1); 
+
+    let e1: Event = Event::KeyPress(42);
+    let r2 = match e1 {
+        Event::Quit => 0,
+        Event::KeyPress(13) => 13,
+        Event::KeyPress(code) => code,
+        _ => 999
+    };
+    print(r2); 
+
+    let p: Point = Point { x: 77, y: 99 };
+    let e2: Event = Event::Click(p);
+    
+    let r3 = match e2 {
+        Event::Quit => 0,
+        Event::Click(Point { x: 10, y: 20 }) => 1,
+        Event::Click(Point { x: x_val, y: _ }) => x_val,
+        _ => 999
+    };
+
+    print(r3); 
+
+    999
+}
+
+run_tests()

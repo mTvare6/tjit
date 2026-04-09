@@ -1,0 +1,9 @@
+fn test_fat_pointers() -> i64 {
+    let msg1: String = "Fat Pointers are working!";
+    
+    print_str(msg1);
+    
+    0
+}
+
+test_fat_pointers()

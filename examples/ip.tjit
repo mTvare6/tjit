@@ -1,0 +1,20 @@
+enum IpAddr {
+    V4(i64, i64, i64, i64),
+    V6(i64)
+}
+
+fn test_ip() -> i64 {
+    let local: IpAddr = IpAddr::V4(127, 0, 0, 1);
+    
+    let sum = match local {
+        IpAddr::V6(addr) => addr,
+        IpAddr::V4(a, b, c, d) => {
+            let total = a + b + c + d;
+            print(total);
+            total
+        }
+    };
+    sum
+}
+
+test_ip()

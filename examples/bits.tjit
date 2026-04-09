@@ -1,0 +1,21 @@
+struct BitPack {
+    is_active: u1,
+    day_of_week: u3,
+    count: i17
+}
+
+fn test_bits() -> i64 {
+    let p = BitPack {
+        is_active: 1,
+        day_of_week: 5,
+        count: 65535
+    };
+    
+    let n = p.count + 1;
+    let next_count = n as i64; 
+    
+    print(next_count);
+    next_count
+}
+
+test_bits()
