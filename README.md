@@ -1,15 +1,14 @@
 # tjit
 
-A minimal JIT compiled language written in Rust using [Cranelift](https://en.wikipedia.org/wiki/Cranelift).
+An experimental strongly typed systems language with a JIT compiler written in Rust using [Cranelift](https://en.wikipedia.org/wiki/Cranelift).
 
 ## Features
 
-- Lexer, parser, and static type checker
-- Typed AST compiled using cranelift
+- Lexer, parser, and static type checker lowering to Cranelift IR with a typed AST HIR
 - Algebraic data types (struct + enums with payload)
 - Pattern matching (ranges, destructuring, wildcards)
+- Bit-packing for arbitrary-width integers (`u13`, `i42`) packed to maximize L1 cache density and promoted during execution.
 - Fixed size arrays
-- Arbitrary width integers and struct bitfields (`u13`, `i42`)
 - Pipeline operator (`|>`)
 - Libc FFI for I/O
 
@@ -62,7 +61,7 @@ struct BitPack {
 }
 ```
 
-**UFCS**
+**Pipeline operator**
 ```rs
 fn add(a: i64, b: i64) -> i64 {
   a + b
@@ -88,3 +87,10 @@ cargo run --release -- <file.tjit>
 ```sh
 tjit <filename.tjit>
 ```
+
+
+## TODO
+- [ ] Heap FFI (`alloc` / `free`)
+- [ ] Affine type system (move semantics)
+- [ ] RAII (Drop heap allocation at the end of scope)
+- [ ] Borrow checker with mutability XOR aliasing via custom MIR (non-cranelift one) lowering and non-lexical lifetimes.
