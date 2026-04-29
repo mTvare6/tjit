@@ -242,7 +242,11 @@ impl JITEngine {
 
             TypedPat::Variable(name, p_ty) => {
                 // load the value and bind it to a cl variable
-                let val = builder.ins().load(p_ty.into(), MemFlags::new(), ptr, 0);
+                let val = if p_ty.is_primitive() {
+                    builder.ins().load(p_ty.into(), MemFlags::new(), ptr, 0)
+                } else {
+                    ptr
+                };
                 let var = Variable::new(*variable_index);
                 *variable_index += 1;
                 builder.declare_var(var, p_ty.into());
@@ -297,15 +301,40 @@ impl JITEngine {
                             .load(cl_type, MemFlags::new(), ptr, word_offset as i32)
                     };
 
-                    // Allocate temp slot for the nested pattern to inspect
-                    let temp_slot_data = StackSlotData::new(StackSlotKind::ExplicitSlot, 8);
-                    let temp_slot = builder.create_sized_stack_slot(temp_slot_data);
-                    let temp_ptr = builder.ins().stack_addr(types::I64, temp_slot, 0);
-
                     if expected_ty.is_primitive() {
+                        let extracted_val = if expected_ty.is_integer_type() && bits < 64 {
+                            let chunk = builder.ins().load(
+                                types::I64,
+                                MemFlags::new(),
+                                ptr,
+                                word_offset as i32,
+                            );
+                            let shifted = builder.ins().ushr_imm(chunk, shift as i64);
+                            let raw_mask = 1u64.checked_shl(bits).unwrap_or(0).wrapping_sub(1);
+                            let mask_val = builder.ins().iconst(types::I64, raw_mask as i64);
+                            let mut isolated = builder.ins().band(shifted, mask_val);
+
+                            if let Type::Int(_) = expected_ty {
+                                let shift_up = 64 - bits;
+                                isolated = builder.ins().ishl_imm(isolated, shift_up as i64);
+                                isolated = builder.ins().sshr_imm(isolated, shift_up as i64);
+                            }
+                            isolated
+                        } else {
+                            let cl_type = expected_ty.into();
+                            builder
+                                .ins()
+                                .load(cl_type, MemFlags::new(), ptr, word_offset as i32)
+                        };
+
+                        let temp_slot_data = StackSlotData::new(StackSlotKind::ExplicitSlot, 8);
+                        let temp_slot = builder.create_sized_stack_slot(temp_slot_data);
+                        let temp_ptr = builder.ins().stack_addr(types::I64, temp_slot, 0);
+
                         builder
                             .ins()
                             .store(MemFlags::new(), extracted_val, temp_ptr, 0);
+
                         Self::emit_pattern_match(
                             builder,
                             p,
@@ -317,10 +346,11 @@ impl JITEngine {
                             enums,
                         );
                     } else {
+                        let nested_ptr = builder.ins().iadd_imm(ptr, word_offset as i64);
                         Self::emit_pattern_match(
                             builder,
                             p,
-                            extracted_val,
+                            nested_ptr,
                             fail_block,
                             variables,
                             variable_index,
@@ -340,7 +370,7 @@ impl JITEngine {
                     let word_offset = (*bit_offset / 64) * 8;
                     let shift = *bit_offset % 64;
 
-                    let extracted_val = if expected_ty.is_integer_type() && bits < 64 {
+                    let _extracted_val = if expected_ty.is_integer_type() && bits < 64 {
                         let chunk = builder.ins().load(
                             types::I64,
                             MemFlags::new(),
@@ -365,14 +395,40 @@ impl JITEngine {
                             .load(cl_type, MemFlags::new(), ptr, word_offset as i32)
                     };
 
-                    let temp_slot_data = StackSlotData::new(StackSlotKind::ExplicitSlot, 8);
-                    let temp_slot = builder.create_sized_stack_slot(temp_slot_data);
-                    let temp_ptr = builder.ins().stack_addr(types::I64, temp_slot, 0);
-
                     if expected_ty.is_primitive() {
+                        let extracted_val = if expected_ty.is_integer_type() && bits < 64 {
+                            let chunk = builder.ins().load(
+                                types::I64,
+                                MemFlags::new(),
+                                ptr,
+                                word_offset as i32,
+                            );
+                            let shifted = builder.ins().ushr_imm(chunk, shift as i64);
+                            let raw_mask = 1u64.checked_shl(bits).unwrap_or(0).wrapping_sub(1);
+                            let mask_val = builder.ins().iconst(types::I64, raw_mask as i64);
+                            let mut isolated = builder.ins().band(shifted, mask_val);
+
+                            if let Type::Int(_) = expected_ty {
+                                let shift_up = 64 - bits;
+                                isolated = builder.ins().ishl_imm(isolated, shift_up as i64);
+                                isolated = builder.ins().sshr_imm(isolated, shift_up as i64);
+                            }
+                            isolated
+                        } else {
+                            let cl_type = expected_ty.into();
+                            builder
+                                .ins()
+                                .load(cl_type, MemFlags::new(), ptr, word_offset as i32)
+                        };
+
+                        let temp_slot_data = StackSlotData::new(StackSlotKind::ExplicitSlot, 8);
+                        let temp_slot = builder.create_sized_stack_slot(temp_slot_data);
+                        let temp_ptr = builder.ins().stack_addr(types::I64, temp_slot, 0);
+
                         builder
                             .ins()
                             .store(MemFlags::new(), extracted_val, temp_ptr, 0);
+
                         Self::emit_pattern_match(
                             builder,
                             f_pat,
@@ -384,10 +440,12 @@ impl JITEngine {
                             enums,
                         );
                     } else {
+                        // BUG FIX: Struct within a struct
+                        let nested_ptr = builder.ins().iadd_imm(ptr, word_offset as i64);
                         Self::emit_pattern_match(
                             builder,
                             f_pat,
-                            extracted_val,
+                            nested_ptr,
                             fail_block,
                             variables,
                             variable_index,
