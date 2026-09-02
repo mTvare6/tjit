@@ -1,18 +1,16 @@
 # tjit
 
-An experimental strongly typed systems language with a JIT compiler written in Rust using [Cranelift](https://en.wikipedia.org/wiki/Cranelift).
+An experimental strongly typed systems language with a JIT compiler written in Rust using [Cranelift](https://en.wikipedia.org/wiki/Cranelift) with a static type checker.
 
 ## Features
 
-- Lexer, parser, and static type checker lowering to Cranelift IR with a typed AST HIR
-- Algebraic data types (struct + enums with payload)
+- ADTs and Arrays
 - Pattern matching (ranges, destructuring, wildcards)
-- Bit-packing for arbitrary-width integers (`u13`, `i42`) packed to maximize L1 cache density and promoted during execution.
-- Fixed size arrays
-- Pipeline operator (`|>`)
-- Libc FFI for I/O
+- Bit-packing for arbitrary-width (<64) integers (`u13`, `i42`) packed to maximise cache efficiency.
+- Pipeline operator (`|>`) as a form of UFCS.
+- Libc FFI for IO
 
-## Example
+## Showcase
 
 **Functions**
 ```rs
@@ -91,6 +89,6 @@ tjit <filename.tjit>
 
 ## TODO
 - [ ] Heap FFI (`alloc` / `free`)
-- [ ] Affine type system (move semantics)
-- [ ] RAII (Drop heap allocation at the end of scope)
-- [ ] Borrow checker with mutability XOR aliasing via custom MIR (non-cranelift one) lowering and non-lexical lifetimes.
+  - [ ] Affine type system (move semantics)
+  - [ ] RAII (and drop traits?)
+  - [ ] Borrow checker with mutability ^ aliasing (and a MIR for that) and [NLLs](https://rust-lang.github.io/rfcs/2094-nll.html).
